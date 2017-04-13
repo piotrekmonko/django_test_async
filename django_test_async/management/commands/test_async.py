@@ -25,7 +25,8 @@ class Consumer(Process):
         dd = settings.DATABASES.dict
         for db in dd:
             settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
-            settings.DATABASES[db]['TEST_NAME'] = 'pid_{}_{}'.format(
+            settings.DATABASES[db]['TEST_NAME'] = '{}/pid_{}_{}'.format(
+                os.environ.get('XDG_RUNTIME_DIR'),
                 self.pid,
                 dd[db].get('TEST_NAME', 'no_testname'))
 
