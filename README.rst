@@ -35,6 +35,6 @@ Important:
     TODO: add a conditional context manager there
 - '--processes' parameter controls how many threads will be used,
     defaults to the number of CPUs, some experimantation needed for best result,
-    CPU# * 0.2 works fine, test using eg. bash time
+    #CPU * 1.2 works fine, test using eg. bash time
 
 

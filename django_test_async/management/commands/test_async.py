@@ -20,17 +20,26 @@ class Consumer(Process):
         q_results = self._kwargs['result']
 
         from django.conf import settings
-        from django_test_async.test_runner import AsyncRunner
+        if 'south' in settings.INSTALLED_APPS:
+            settings.INSTALLED_APPS.remove('south')
+
         dd = settings.DATABASES.dict
         for db in dd:
             settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
             settings.DATABASES[db]['TEST_NAME'] = 'pid_{}_{}'.format(
                 self.pid,
                 dd[db].get('TEST_NAME', 'no_testname'))
-        self.runner = AsyncRunner(**self._kwargs['opts'])
-        self.runner.interactive = False
-        self.runner.setup_test_environment()
-        self.old_config = self.runner.setup_databases()
+
+        from django_test_async.test_runner import AsyncRunner
+        try:
+            self.runner = AsyncRunner(**self._kwargs['opts'])
+            self.runner.interactive = False
+            self.runner.setup_test_environment()
+            self.old_config = self.runner.setup_databases()
+        except:
+            if self._popen:
+                self.terminate()
+            raise
 
         with Bar(label='TESTING', width=64, expected_size=total) as bar:
             for suite in iter(q_suites.get, STOPBIT):
@@ -90,6 +99,9 @@ class Command(BaseCommand):
             logger.removeHandler(handler)
 
     def handle(self, *test_labels, **options):
+        from django.conf import settings
+        if 'south' in settings.INSTALLED_APPS:
+            settings.INSTALLED_APPS.remove('south')
         from django_test_async.test_runner import AsyncRunner
 
         options['verbosity'] = int(options.get('verbosity'))
