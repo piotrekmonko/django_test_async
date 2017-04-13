@@ -29,6 +29,11 @@ class Consumer(Process):
                 self.pid,
                 dd[db].get('TEST_NAME', 'no_testname'))
 
+        for cc in settings.CACHES:
+            settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
+                self.pid,
+                settings.CACHES[cc].get('KEY_PREFIX', 'no_cache_prefix'))
+
         # prepare environment and databases, abort tests on any errors
         from django_test_async.test_runner import AsyncRunner
         try:
@@ -150,11 +155,7 @@ class Command(BaseCommand):
             ww.start()
             # null-terminate queue and wait for workers to join
             suites_queue.put(STOPBIT)
-            tests_done[ww.pid] = {
-                'run': 0,
-                'errs': [],
-                'fails': [],
-            }
+            tests_done[ww.pid] = dict((('run', 0), ('errs', list()), ('fails', list())))
 
         with Bar(label='TESTING', width=42, expected_size=total) as bar:
             finished = 0
@@ -168,7 +169,7 @@ class Command(BaseCommand):
                         finished += 1
                     else:
                         done += 1
-                        tests_done[pid]['run'] = cmd.testsRun
+                        tests_done[pid]['run'] += cmd.testsRun
                         tests_done[pid]['errs'].extend(cmd.errors)
                         tests_done[pid]['fails'].extend(cmd.failures)
                     if finished == procs:
