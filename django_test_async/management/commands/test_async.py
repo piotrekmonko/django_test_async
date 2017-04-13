@@ -1,5 +1,5 @@
 import logging
-from multiprocessing import Process, JoinableQueue
+from billiard import Process, JoinableQueue, cpu_count
 from clint.textui.progress import Bar
 import os
 from optparse import make_option
@@ -15,7 +15,6 @@ class Consumer(Process):
     old_config = None
 
     def run(self):
-        total = self._kwargs['length']
         q_suites = self._kwargs['suites']
         q_results = self._kwargs['result']
 
@@ -30,6 +29,7 @@ class Consumer(Process):
                 self.pid,
                 dd[db].get('TEST_NAME', 'no_testname'))
 
+        # prepare environment and databases, abort tests on any errors
         from django_test_async.test_runner import AsyncRunner
         try:
             self.runner = AsyncRunner(**self._kwargs['opts'])
@@ -41,23 +41,26 @@ class Consumer(Process):
                 self.terminate()
             raise
 
-        with Bar(label='TESTING', width=64, expected_size=total) as bar:
+        # consume suites queue, update results queue
+        try:
             for suite in iter(q_suites.get, STOPBIT):
                 result = self.runner.run_suite(suite)
                 q_results.put((
                     self.pid,
-                    self.runner.suite_result(suite, result)
+                    result
+                    # self.runner.suite_result(suite, result)
                 ))
                 q_suites.task_done()
-                bar.show(total - q_suites.qsize())
-        self._kwargs['suites'].task_done()
-        print 'Tearing down databases'
-        q_results.put((
-            self.pid, STOPBIT
-        ))
-        self.runner.teardown_databases(self.old_config)
-        self.runner.teardown_test_environment()
-        # mark STOPBIT task as processed too
+            # mark STOPBIT task as processed too
+            q_suites.task_done()
+            self.runner.teardown_databases(self.old_config)
+            self.runner.teardown_test_environment()
+            q_results.put((self.pid, STOPBIT))
+        except:
+            self.runner.teardown_databases(self.old_config)
+            self.runner.teardown_test_environment()
+            q_results.put((self.pid, STOPBIT))
+            raise
 
 
 class Command(BaseCommand):
@@ -105,7 +108,7 @@ class Command(BaseCommand):
         from django_test_async.test_runner import AsyncRunner
 
         options['verbosity'] = int(options.get('verbosity'))
-        procs = int(options.pop('processes', 1) or 0)
+        procs = int(options.pop('processes', None) or cpu_count())
 
         if options.get('liveserver') is not None:
             os.environ['DJANGO_LIVE_TEST_SERVER_ADDRESS'] = options['liveserver']
@@ -114,13 +117,18 @@ class Command(BaseCommand):
         suites_queue = JoinableQueue()
         result_queue = JoinableQueue()
         workers = []
+        tests_done = {}
 
         # put suites in processing queue
         suites = AsyncRunner(**options).get_suite_list(test_labels, None)
         for s in suites:
             suites_queue.put(s)
 
-        print 'Starting %s tests in %s processes.' % (len(suites), procs)
+        total = len(suites)
+        if procs > total:
+            procs = total
+        print 'Starting %s tests in %s processes.' % (total, procs)
+
         pargs = {
             'opts': options,
             'length': len(suites),
@@ -140,20 +148,53 @@ class Command(BaseCommand):
             ww = Consumer(kwargs=pargs)
             workers.append(ww)
             ww.start()
-
-        # null-terminate queue and wait for workers to join
-        for i in workers:
+            # null-terminate queue and wait for workers to join
             suites_queue.put(STOPBIT)
-        try:
-            suites_queue.join()
-        except:
-            for i in workers:
-                i.terminate()
+            tests_done[ww.pid] = {
+                'run': 0,
+                'errs': [],
+                'fails': [],
+            }
 
-        # for i in iter(result_queue.get, STOPBIT):
-        #     print 'Result', i[0], ':', i[1]
+        with Bar(label='TESTING', width=42, expected_size=total) as bar:
+            finished = 0
+            done = 1
+            try:
+                while True:
+                    bar.show(done)
+                    pid, cmd = result_queue.get()
+                    if cmd == STOPBIT:
+                        print 'Got STOPBIT'
+                        finished += 1
+                    else:
+                        done += 1
+                        tests_done[pid]['run'] = cmd.testsRun
+                        tests_done[pid]['errs'].extend(cmd.errors)
+                        tests_done[pid]['fails'].extend(cmd.failures)
+                    if finished == procs:
+                        print 'Got ALL STOPBITS'
+                        break
+            except:
+                print 'Killing workers'
+                # kill all workers if any or main process failed
+                for i in workers:
+                    i.terminate()
+                raise
 
+        total_tests = 0
+        total_errs = 0
+        total_fails = 0
+        print '=' * 60
         for i, j in enumerate(workers):
+            print 'Worker', i, 'pid', j.pid, 'finished with', tests_done[j.pid]['run'], 'tests, ', \
+                len(tests_done[j.pid]['errs']), 'errors and ', len(tests_done[j.pid]['fails']), 'failures.'
             j.join(5)
-            print 'Worker', i, 'pid', j.pid, 'finished'
+            total_tests += tests_done[j.pid]['run']
+            total_errs += len(tests_done[j.pid]['errs'])
+            total_fails += len(tests_done[j.pid]['fails'])
 
+        print '-' * 60
+        print 'Tests run:', total_tests
+        print 'Errors:', total_errs
+        print 'Failures:', total_fails
+        print '=' * 60
