@@ -182,19 +182,29 @@ class Command(BaseCommand):
                 raise
 
         total_tests = 0
-        total_errs = 0
-        total_fails = 0
-        print '=' * 60
+        total_errs = []
+        total_fails = []
+        print '=' * 70
         for i, j in enumerate(workers):
-            print 'Worker', i, 'pid', j.pid, 'finished with', tests_done[j.pid]['run'], 'tests, ', \
+            print 'Worker', i, 'pid', j.pid, 'finished with ', tests_done[j.pid]['run'], 'tests, ', \
                 len(tests_done[j.pid]['errs']), 'errors and ', len(tests_done[j.pid]['fails']), 'failures.'
             j.join(5)
             total_tests += tests_done[j.pid]['run']
-            total_errs += len(tests_done[j.pid]['errs'])
-            total_fails += len(tests_done[j.pid]['fails'])
+            total_errs.extend(tests_done[j.pid]['errs'])
+            total_fails.extend(tests_done[j.pid]['fails'])
 
-        print '-' * 60
+        if total_fails:
+            print '-' * 70
+            for i in total_fails:
+                print i
+
+        if total_errs:
+            print '-' * 70
+            for i in total_errs:
+                print i
+
+        print '-' * 70
         print 'Tests run:', total_tests
-        print 'Errors:', total_errs
-        print 'Failures:', total_fails
-        print '=' * 60
+        print 'Errors:', len(total_errs)
+        print 'Failures:', len(total_fails)
+        print '=' * 70
