@@ -30,10 +30,11 @@ Django `DiscoverRunner` - modify if needed or include in your own runner.
 Important:
 
 - 'test_async' command substitutes settings.DATABASES engines
-with 'django.db.backends.sqlite3'
-- some tests might not work in parallel, TODO: add a conditional context manager there
+    with 'django.db.backends.sqlite3'
+- some tests might not work in parallel
+    TODO: add a conditional context manager there
 - '--processes' parameter controls how many threads will be used,
-defaults to the number of CPUs, some experimantation needed for best result,
-CPU# * 0.2 works fine, test using eg. bash time
+    defaults to the number of CPUs, some experimantation needed for best result,
+    CPU# * 0.2 works fine, test using eg. bash time
 
 
