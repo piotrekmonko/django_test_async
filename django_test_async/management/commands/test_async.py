@@ -2,7 +2,7 @@ import os
 from optparse import make_option
 from Queue import Empty
 import logging
-from multiprocessing import Process, JoinableQueue, cpu_count
+from billiard import Process, JoinableQueue, cpu_count
 from clint.textui.progress import Bar
 from django.core.management.base import BaseCommand
 import sys
@@ -123,9 +123,9 @@ class Consumer(Process):
         self.runner.teardown_test_environment()
         os.rmdir(self.settings.NFS_SHARED_DIR)
         os.rmdir(self.settings.WORK_DIR)
-        for db in self.settings.DATABASES:
-            if os.path.exists(self.settings[db]['TEST_NAME']):
-                os.remove(self.settings[db]['TEST_NAME'])
+        # for db in self.settings.DATABASES:
+        #     if os.path.exists(self.settings[db]['TEST_NAME']):
+        #         os.remove(self.settings[db]['TEST_NAME'])
         self._kwargs['result'].put((self.pid, STOPBIT))
         os.rmdir(self.BASEDIR)
 
