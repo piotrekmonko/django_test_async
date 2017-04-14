@@ -1,5 +1,7 @@
 from django.test.runner import DiscoverRunner
+from django.utils.unittest.runner import TextTestRunner
 from django.utils.unittest.suite import TestSuite
+from cStringIO import StringIO
 
 
 class AsyncRunner(DiscoverRunner):
@@ -21,3 +23,12 @@ class AsyncRunner(DiscoverRunner):
         self.teardown_databases(old_config)
         self.teardown_test_environment()
         return self.suite_result(suite, result)
+
+    def run_suite(self, suite, **kwargs):
+        for s in suite._tests:
+            print s.id(), '\033[K'
+        return TextTestRunner(
+            stream=StringIO(),
+            verbosity=self.verbosity,
+            failfast=self.failfast
+        ).run(suite)
