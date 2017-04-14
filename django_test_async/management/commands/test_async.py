@@ -6,44 +6,42 @@ from multiprocessing import Process, JoinableQueue, cpu_count
 from clint.textui.progress import Bar
 from django.core.management.base import BaseCommand
 import sys
+from unittest import loader, TestCase
 
 
 STOPBIT = 0xffff
+
+
+class _FailedTest(TestCase):
+    _testMethodName = None
+
+    def __init__(self, method_name, exception):
+        self._exception = exception
+        super(_FailedTest, self).__init__(method_name)
+
+    def __getattr__(self, name):
+        if name != self._testMethodName:
+            return super(_FailedTest, self).__getattr__(name)
+
+        def testFailure():
+            raise self._exception
+        return testFailure
 
 
 class Consumer(Process):
     runner = None
     old_config = None
     settings = None
+    BASEDIR = None
 
     def run(self):
         q_suites = self._kwargs['suites']
         q_results = self._kwargs['result']
+        self.BASEDIR = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'test_async_%s' % self.pid)
+        if not os.path.exists(self.BASEDIR):
+            os.mkdir(self.BASEDIR)
 
-        from django.conf import settings
-        if 'south' in settings.INSTALLED_APPS:
-            settings.INSTALLED_APPS.remove('south')
-
-        dd = settings.DATABASES.dict
-        for db in dd:
-            settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
-            settings.DATABASES[db]['TEST_NAME'] = '{}/pid_{}_{}'.format(
-                os.environ.get('XDG_RUNTIME_DIR'),
-                self.pid,
-                dd[db].get('TEST_NAME', 'no_testname'))
-
-        for cc in settings.CACHES:
-            settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
-                self.pid,
-                settings.CACHES[cc].get('KEY_PREFIX', 'no_cache_prefix'))
-
-        settings.WORK_DIR = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'work_%s' % self.pid)
-        if not os.path.exists(settings.WORK_DIR):
-            os.mkdir(settings.WORK_DIR)
-        settings.NFS_SHARED_DIR = os.path.join(settings.WORK_DIR, 'shared')
-        if not os.path.exists(settings.NFS_SHARED_DIR):
-            os.mkdir(settings.NFS_SHARED_DIR)
-        self.settings = settings
+        self.apply_patches()
 
         # prepare environment and databases, abort tests on any errors
         from django_test_async.test_runner import AsyncRunner
@@ -54,7 +52,7 @@ class Consumer(Process):
             self.old_config = self.runner.setup_databases()
         except:
             print 'Error setting up databases'
-            if 'south' in settings.INSTALLED_APPS:
+            if 'south' in self.settings.INSTALLED_APPS:
                 print 'Perhaps try without south?'
             self.cleanup()
             raise
@@ -74,6 +72,51 @@ class Consumer(Process):
             self.cleanup()
             raise
 
+    @staticmethod
+    def _make_failed_import_test(name, suiteClass):
+        message = 'Failed to import test module: %s' % name
+        test = _FailedTest(name, ImportError(message))
+        return suiteClass((test,))
+
+    @staticmethod
+    def _make_failed_load_tests(name, exception, suiteClass):
+        test = _FailedTest(name, exception)
+        return suiteClass((test,))
+
+    def apply_patches(self):
+        # patch testLoader to make it pickable
+        loader._make_failed_load_tests = self._make_failed_load_tests
+        loader._make_failed_import_test = self._make_failed_import_test
+
+        # alter settings
+        from django.conf import settings
+        if 'south' in settings.INSTALLED_APPS:
+            settings.INSTALLED_APPS.remove('south')
+
+        dd = settings.DATABASES.dict
+        for db in dd:
+            settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
+            settings.DATABASES[db]['TEST_NAME'] = os.path.join(
+                self.BASEDIR,
+                'pid_{}_{}'.format(
+                    self.pid,
+                    dd[db].get('TEST_NAME', 'no_testname')
+                )
+            )
+
+        for cc in settings.CACHES:
+            settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
+                self.pid,
+                settings.CACHES[cc].get('KEY_PREFIX', 'no_cache_prefix'))
+
+        settings.WORK_DIR = os.path.join(self.BASEDIR, 'work_%s' % self.pid)
+        if not os.path.exists(settings.WORK_DIR):
+            os.mkdir(settings.WORK_DIR)
+        settings.NFS_SHARED_DIR = os.path.join(settings.WORK_DIR, 'shared')
+        if not os.path.exists(settings.NFS_SHARED_DIR):
+            os.mkdir(settings.NFS_SHARED_DIR)
+        self.settings = settings
+
     def cleanup(self):
         # mark STOPBIT task as processed too
         self.runner.teardown_databases(self.old_config)
@@ -84,6 +127,7 @@ class Consumer(Process):
             if os.path.exists(self.settings[db]['TEST_NAME']):
                 os.remove(self.settings[db]['TEST_NAME'])
         self._kwargs['result'].put((self.pid, STOPBIT))
+        os.rmdir(self.BASEDIR)
 
 
 class Command(BaseCommand):
