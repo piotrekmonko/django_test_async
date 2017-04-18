@@ -2,12 +2,17 @@ import os
 from optparse import make_option
 from Queue import Empty
 import logging
-from billiard import Process, JoinableQueue, cpu_count
+from billiard import Process, JoinableQueue, cpu_count, log_to_stderr
 from clint.textui.progress import Bar
 from django.core.management.base import BaseCommand
 import sys
 from unittest import loader, TestCase
+import time
+import shutil
 
+
+mpl = log_to_stderr()
+mpl.setLevel(logging.INFO)
 
 STOPBIT = 0xffff
 
@@ -29,15 +34,21 @@ class _FailedTest(TestCase):
 
 
 class Consumer(Process):
+    stopping = False
     runner = None
     old_config = None
     settings = None
+    ROOT = None
     BASEDIR = None
 
     def run(self):
         q_suites = self._kwargs['suites']
         q_results = self._kwargs['result']
-        self.BASEDIR = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'test_async_%s' % self.pid)
+        tasks = self._kwargs['max_tasks']
+        self.ROOT = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'test_async')
+        if not os.path.exists(self.ROOT):
+            os.mkdir(self.ROOT)
+        self.BASEDIR = os.path.join(self.ROOT, 'pid_%s' % self.pid or 'mainprocess')
         if not os.path.exists(self.BASEDIR):
             os.mkdir(self.BASEDIR)
 
@@ -61,12 +72,16 @@ class Consumer(Process):
         try:
             for suite in iter(q_suites.get, STOPBIT):
                 result = self.runner.run_suite(suite)
-                result.stream = result.stream.stream.getvalue()
+                if hasattr(result.stream.stream, 'getvalue'):
+                    result.stream = result.stream.stream.getvalue()
                 q_results.put((
                     self.pid,
                     result
                 ))
                 q_suites.task_done()
+                tasks -= 1
+                if not tasks:
+                    break
             self.cleanup()
         except:
             self.cleanup()
@@ -98,9 +113,9 @@ class Consumer(Process):
             settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
             settings.DATABASES[db]['TEST_NAME'] = os.path.join(
                 self.BASEDIR,
-                'pid_{}_{}'.format(
-                    self.pid,
-                    dd[db].get('TEST_NAME', 'no_testname')
+                'db_{}_{}'.format(
+                    self.pid or 'mainprocess',
+                    dd[db].get('TEST_NAME', 'notestname')
                 )
             )
 
@@ -115,19 +130,20 @@ class Consumer(Process):
         settings.NFS_SHARED_DIR = os.path.join(settings.WORK_DIR, 'shared')
         if not os.path.exists(settings.NFS_SHARED_DIR):
             os.mkdir(settings.NFS_SHARED_DIR)
+        settings.TENANT_DIR = os.path.join(settings.WORK_DIR, 'tenant')
+        if not os.path.exists(settings.TENANT_DIR):
+            os.mkdir(settings.TENANT_DIR)
         self.settings = settings
 
     def cleanup(self):
+        try:
+            self.runner.teardown_databases(self.old_config)
+            self.runner.teardown_test_environment()
+            shutil.rmtree(self.BASEDIR, ignore_errors=True)
+        except Exception as e:
+            print self.name, 'cleanup error:', e
         # mark STOPBIT task as processed too
-        self.runner.teardown_databases(self.old_config)
-        self.runner.teardown_test_environment()
-        os.rmdir(self.settings.NFS_SHARED_DIR)
-        os.rmdir(self.settings.WORK_DIR)
-        # for db in self.settings.DATABASES:
-        #     if os.path.exists(self.settings[db]['TEST_NAME']):
-        #         os.remove(self.settings[db]['TEST_NAME'])
         self._kwargs['result'].put((self.pid, STOPBIT))
-        os.rmdir(self.BASEDIR)
 
 
 class Command(BaseCommand):
@@ -143,6 +159,8 @@ class Command(BaseCommand):
                  'default value is localhost:8081.'),
         make_option('--processes', '-p', action='store', type='int', dest='processes', default=None,
             help='Use this many processes. Defaults to system cpu count.'),
+        make_option('--tasks', '-t', action='store', type='int', dest='max_tasks', default=None,
+            help='Kill worker after this many processed tasks.'),
     )
     help = ('Discover and run tests in the specified modules or the current directory.')
     args = '[path.to.modulename|path.to.modulename.TestCase|path.to.modulename.TestCase.test_method]...'
@@ -186,75 +204,109 @@ class Command(BaseCommand):
                 print 'Joining', i.name
                 i.join(1)
 
+    def launch_consumer(self):
+        ww = Consumer(kwargs=self.pargs)
+        self.workers.append(ww)
+        ww.start()
+        # null-terminate queue and wait for workers to join
+        self.suites_queue.put(STOPBIT)
+        self.tests_done[ww.pid] = dict((('run', 0), ('errs', list()), ('fails', list())))
+
+    def retire_consumers(self):
+        print 'Max tasks', self.max_tasks
+        if not self.max_tasks:
+            return
+        # dont launch new consumers if tasks left can be shared among running consumers
+        print 'Tasks left / queue:', self.alive() * self.max_tasks, self.suites_queue.qsize()
+        if self.alive() * self.max_tasks > self.suites_queue.qsize():
+            return
+        # dont launch new consumers if that would exceed allowed processes
+        print 'Procs alive / max procs:', self.alive(), self.max_procs
+        if self.alive() >= self.max_procs:
+            return
+        print 'Launching consumer'
+        self.launch_consumer()
+
+    def alive(self):
+        return sum(map(lambda x: x.is_alive(), self.workers))
+
     def handle(self, *test_labels, **options):
-        from django.conf import settings
-        if 'south' in settings.INSTALLED_APPS:
-            settings.INSTALLED_APPS.remove('south')
+        # from django.conf import settings
+        # if 'south' in settings.INSTALLED_APPS:
+        #     settings.INSTALLED_APPS.remove('south')
         from django_test_async.test_runner import AsyncRunner
 
         options['verbosity'] = int(options.get('verbosity'))
-        procs = int(options.pop('processes', None) or cpu_count())
+        self.max_procs = int(options.pop('processes', None) or cpu_count())
+        self.max_tasks = options.pop('max_tasks')
 
         if options.get('liveserver') is not None:
             os.environ['DJANGO_LIVE_TEST_SERVER_ADDRESS'] = options['liveserver']
             del options['liveserver']
 
-        suites_queue = JoinableQueue()
+        self.suites_queue = JoinableQueue()
         result_queue = JoinableQueue()
-        tests_done = {}
+        self.tests_done = {}
 
         # put suites in processing queue
         suites = AsyncRunner(**options).get_suite_list(test_labels, None)
         for s in suites:
-            suites_queue.put(s)
+            self.suites_queue.put(s)
 
         total = len(suites)
-        if procs > total:
-            procs = total
-        print 'Starting %s tests in %s processes.' % (total, procs)
+        if self.max_procs > total:
+            self.max_procs = total
+        print 'Starting %s tests in %s processes%s' % \
+              (total, self.max_procs, ' restarted every %s tasks.' % self.max_tasks if self.max_tasks else '.')
 
-        pargs = {
+        self.pargs = {
             'opts': options,
             'length': len(suites),
-            'suites': suites_queue,
+            'suites': self.suites_queue,
             'result': result_queue,
+            'max_tasks': self.max_tasks,
         }
         # single-threaded run
-        if procs <= 1:
-            worker = Consumer(kwargs=pargs)
+        if self.max_procs <= 1:
+            self.suites_queue.put(STOPBIT)
+            worker = Consumer(kwargs=self.pargs)
             worker.run()
-            for p in iter(result_queue):
-                print p
+            while True:
+                pid, cmd = result_queue.get()
+                print pid, cmd
+                if cmd == STOPBIT:
+                    break
             return
 
         # start workers
-        for i in range(procs):
-            ww = Consumer(kwargs=pargs)
-            self.workers.append(ww)
-            ww.start()
-            # null-terminate queue and wait for workers to join
-            suites_queue.put(STOPBIT)
-            tests_done[ww.pid] = dict((('run', 0), ('errs', list()), ('fails', list())))
-        suites_queue.close()
+        for i in range(self.max_procs):
+            self.launch_consumer()
+        # suites_queue.close()
 
         with Bar(label='      ', width=42, expected_size=total) as bar:
             finished = done = iterations = 0
             s = '|/-\\'
             pid = cmd = None
+            processing = []
+            alive = 1
             try:
-                while done < total:
+                while done < total and alive:
                     iterations += 1
-                    alive = sum(map(lambda x: x.is_alive(), self.workers))
+                    alive = self.alive()
                     if done == 0:
-                        bar.label = '  %s  %s  ' % ('.' * procs, s[iterations % 4])
+                        bar.label = '  %s  %s  ' % ('.' * self.max_procs, s[iterations % 4])
                     else:
-                        bar.label = '  %s%s  %s  ' % ('R' * alive, 'S' * (procs - alive), s[iterations % 4])
+                        bar.label = '  {}  {}  '.format(
+                            ' '.join(map(lambda x: str(x['run']), self.tests_done.values())),
+                            s[iterations % 4])
                     bar.show(done)
                     if not alive:
                         print '>>> No live workers left!'
                         raise KeyboardInterrupt('No workers alive')
                     try:
-                        pid, cmd = result_queue.get(timeout=0.1)
+                        pid, cmd = result_queue.get(timeout=1)
+                        if pid and pid not in processing:
+                            processing.append(pid)
                     except Empty:
                         # print '>>> skipped a bit', pid, cmd
                         continue
@@ -262,16 +314,18 @@ class Command(BaseCommand):
                         print 'Got STOPBIT'
                         for i in self.workers:
                             if i.pid == pid:
-                                i.join(1)
+                                i.join(10)
                         finished += 1
                     else:
                         done += cmd.testsRun
-                        tests_done[pid]['run'] += cmd.testsRun
-                        tests_done[pid]['errs'].extend(cmd.errors)
-                        tests_done[pid]['fails'].extend(cmd.failures)
-                    if finished == procs:
-                        print 'Got ALL STOPBITS'
-                        break
+                        self.tests_done[pid]['run'] += cmd.testsRun
+                        self.tests_done[pid]['errs'].extend(cmd.errors)
+                        self.tests_done[pid]['fails'].extend(cmd.failures)
+                    # if finished == len(self.workers):
+                    #     print 'Got ALL STOPBITS'
+                    #     break
+                    bar.show(done)
+                    self.retire_consumers()
                     bar.show(done)
             except KeyboardInterrupt:
                 print 'Stopping'
@@ -287,11 +341,13 @@ class Command(BaseCommand):
         total_fails = []
         print '=' * 70
         for i, j in enumerate(self.workers):
-            print 'Worker', i, 'pid', j.pid, 'finished with ', tests_done[j.pid]['run'], 'tests, ', \
-                len(tests_done[j.pid]['errs']), 'errors and ', len(tests_done[j.pid]['fails']), 'failures.'
-            total_tests += tests_done[j.pid]['run']
-            total_errs.extend(tests_done[j.pid]['errs'])
-            total_fails.extend(tests_done[j.pid]['fails'])
+            print 'Worker', i, 'pid', j.pid, 'finished with ', \
+                self.tests_done[j.pid]['run'], 'tests, ', \
+                len(self.tests_done[j.pid]['errs']), 'errors and ', \
+                len(self.tests_done[j.pid]['fails']), 'failures.'
+            total_tests += self.tests_done[j.pid]['run']
+            total_errs.extend(self.tests_done[j.pid]['errs'])
+            total_fails.extend(self.tests_done[j.pid]['fails'])
 
         for f in (total_fails, total_errs):
             if f:

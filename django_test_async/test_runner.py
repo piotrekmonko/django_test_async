@@ -2,6 +2,7 @@ from django.test.runner import DiscoverRunner
 from django.utils.unittest.runner import TextTestRunner
 from django.utils.unittest.suite import TestSuite
 from cStringIO import StringIO
+import sys
 
 
 class AsyncRunner(DiscoverRunner):
@@ -25,10 +26,16 @@ class AsyncRunner(DiscoverRunner):
         return self.suite_result(suite, result)
 
     def run_suite(self, suite, **kwargs):
-        for s in suite._tests:
-            print s.id(), '\033[K'
-        return TextTestRunner(
-            stream=StringIO(),
+        stream = sys.stderr if self.verbosity and self.verbosity > 1 else StringIO()
+        result = TextTestRunner(
+            stream=stream,
             verbosity=self.verbosity,
             failfast=self.failfast
         ).run(suite)
+        state = 'OK ' * result.testsRun
+        if result.failures:
+            state = 'F' * len(result.failures)
+        if result.errors:
+            state = 'E' * len(result.errors)
+        print '{} {}\033[K'.format(state, suite._tests[0].id())
+        return result
