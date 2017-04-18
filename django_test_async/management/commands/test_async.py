@@ -33,6 +33,23 @@ class _FailedTest(TestCase):
         return testFailure
 
 
+def _make_failed_import_test(name, suiteClass):
+    message = 'Failed to import test module: %s' % name
+    test = _FailedTest(name, ImportError(message))
+    return suiteClass((test,))
+
+
+def _make_failed_load_tests(name, exception, suiteClass):
+    test = _FailedTest(name, exception)
+    return suiteClass((test,))
+
+
+# patch testLoader to make it pickable
+loader._make_failed_load_tests = _make_failed_load_tests
+loader._make_failed_import_test = _make_failed_import_test
+
+
+
 class Consumer(Process):
     stopping = False
     runner = None
@@ -44,7 +61,7 @@ class Consumer(Process):
     def run(self):
         q_suites = self._kwargs['suites']
         q_results = self._kwargs['result']
-        tasks = self._kwargs['max_tasks']
+        max_tasks = self._kwargs['max_tasks']
         self.ROOT = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'test_async')
         if not os.path.exists(self.ROOT):
             os.mkdir(self.ROOT)
@@ -69,6 +86,7 @@ class Consumer(Process):
             raise
 
         # consume suites queue, update results queue
+        tasks = 0
         try:
             for suite in iter(q_suites.get, STOPBIT):
                 result = self.runner.run_suite(suite)
@@ -79,29 +97,18 @@ class Consumer(Process):
                     result
                 ))
                 q_suites.task_done()
-                tasks -= 1
-                if not tasks:
+                tasks += 1
+                if max_tasks and tasks >= max_tasks:
                     break
             self.cleanup()
         except:
             self.cleanup()
             raise
 
-    @staticmethod
-    def _make_failed_import_test(name, suiteClass):
-        message = 'Failed to import test module: %s' % name
-        test = _FailedTest(name, ImportError(message))
-        return suiteClass((test,))
-
-    @staticmethod
-    def _make_failed_load_tests(name, exception, suiteClass):
-        test = _FailedTest(name, exception)
-        return suiteClass((test,))
-
     def apply_patches(self):
         # patch testLoader to make it pickable
-        loader._make_failed_load_tests = self._make_failed_load_tests
-        loader._make_failed_import_test = self._make_failed_import_test
+        loader._make_failed_load_tests = _make_failed_load_tests
+        loader._make_failed_import_test = _make_failed_import_test
 
         # alter settings
         from django.conf import settings
@@ -167,10 +174,16 @@ class Command(BaseCommand):
 
     requires_model_validation = False
     workers = []
+    max_procs = 0
+    max_tasks = 0
 
     def __init__(self):
         self.test_runner = None
         super(Command, self).__init__()
+
+    def log(self, level, *args):
+        if level <= self.verbosity:
+            print ' '.join(map(unicode, args)), '\033[K'
 
     def execute(self, *args, **options):
         if int(options['verbosity']) > 0:
@@ -194,14 +207,14 @@ class Command(BaseCommand):
         # for i in self.workers:
         #     print i.name
         #     i.join(5)
-        print 'Killing workers:'
+        self.log(2, 'Killing workers:')
         for i in self.workers:
             if i.is_alive():
-                print i.name
+                self.log(2, i.name)
                 i.terminate()
         for i in self.workers:
             if i.is_alive():
-                print 'Joining', i.name
+                self.log(2, 'Joining', i.name)
                 i.join(1)
 
     def launch_consumer(self):
@@ -213,18 +226,18 @@ class Command(BaseCommand):
         self.tests_done[ww.pid] = dict((('run', 0), ('errs', list()), ('fails', list())))
 
     def retire_consumers(self):
-        print 'Max tasks', self.max_tasks
+        self.log(3, 'Max tasks', self.max_tasks)
         if not self.max_tasks:
             return
         # dont launch new consumers if tasks left can be shared among running consumers
-        print 'Tasks left / queue:', self.alive() * self.max_tasks, self.suites_queue.qsize()
+        self.log(3, 'Tasks left / queue:', self.alive() * self.max_tasks, self.suites_queue.qsize())
         if self.alive() * self.max_tasks > self.suites_queue.qsize():
             return
         # dont launch new consumers if that would exceed allowed processes
-        print 'Procs alive / max procs:', self.alive(), self.max_procs
+        self.log(3, 'Procs alive / max procs:', self.alive(), self.max_procs)
         if self.alive() >= self.max_procs:
             return
-        print 'Launching consumer'
+        self.log(3, 'Launching consumer')
         self.launch_consumer()
 
     def alive(self):
@@ -236,7 +249,7 @@ class Command(BaseCommand):
         #     settings.INSTALLED_APPS.remove('south')
         from django_test_async.test_runner import AsyncRunner
 
-        options['verbosity'] = int(options.get('verbosity'))
+        self.verbosity = options['verbosity'] = int(options.get('verbosity'))
         self.max_procs = int(options.pop('processes', None) or cpu_count())
         self.max_tasks = options.pop('max_tasks')
 
@@ -271,11 +284,9 @@ class Command(BaseCommand):
             self.suites_queue.put(STOPBIT)
             worker = Consumer(kwargs=self.pargs)
             worker.run()
-            while True:
-                pid, cmd = result_queue.get()
+            while worker.is_alive():
+                pid, cmd = result_queue.get(1)
                 print pid, cmd
-                if cmd == STOPBIT:
-                    break
             return
 
         # start workers
@@ -301,17 +312,17 @@ class Command(BaseCommand):
                             s[iterations % 4])
                     bar.show(done)
                     if not alive:
-                        print '>>> No live workers left!'
+                        self.log(2, '>>> No live workers left!')
                         raise KeyboardInterrupt('No workers alive')
                     try:
-                        pid, cmd = result_queue.get(timeout=1)
+                        pid, cmd = result_queue.get(timeout=0.1)
                         if pid and pid not in processing:
                             processing.append(pid)
                     except Empty:
-                        # print '>>> skipped a bit', pid, cmd
+                        self.log(5, '>>> skipped a bit', pid, cmd)
                         continue
                     if cmd == STOPBIT:
-                        print 'Got STOPBIT'
+                        self.log(4, 'Got STOPBIT')
                         for i in self.workers:
                             if i.pid == pid:
                                 i.join(10)
@@ -330,7 +341,7 @@ class Command(BaseCommand):
             except KeyboardInterrupt:
                 print 'Stopping'
             except:
-                print 'An exception'
+                self.log(5, 'An exception')
                 self.killall()
                 raise
 
@@ -339,12 +350,12 @@ class Command(BaseCommand):
         total_tests = 0
         total_errs = []
         total_fails = []
-        print '=' * 70
+        self.log(1, '=' * 70)
         for i, j in enumerate(self.workers):
-            print 'Worker', i, 'pid', j.pid, 'finished with ', \
+            self.log(1, 'Worker', i, 'pid', j.pid, 'finished with ', \
                 self.tests_done[j.pid]['run'], 'tests, ', \
                 len(self.tests_done[j.pid]['errs']), 'errors and ', \
-                len(self.tests_done[j.pid]['fails']), 'failures.'
+                len(self.tests_done[j.pid]['fails']), 'failures.')
             total_tests += self.tests_done[j.pid]['run']
             total_errs.extend(self.tests_done[j.pid]['errs'])
             total_fails.extend(self.tests_done[j.pid]['fails'])
@@ -352,13 +363,13 @@ class Command(BaseCommand):
         for f in (total_fails, total_errs):
             if f:
                 for testsuite, traceback in f:
-                    print '-' * 70
-                    print testsuite
-                    print traceback
+                    self.log(1, '-' * 70)
+                    self.log(1, testsuite)
+                    self.log(1, traceback)
 
-        print '-' * 70
-        print 'Tests run:', total_tests
-        print 'Errors:', len(total_errs)
-        print 'Failures:', len(total_fails)
-        print '=' * 70
+        self.log(1, '-' * 70)
+        self.log(1, 'Tests run:', total_tests)
+        self.log(1, 'Errors:', len(total_errs))
+        self.log(1, 'Failures:', len(total_fails))
+        self.log(1, '=' * 70)
         sys.exit(0)
