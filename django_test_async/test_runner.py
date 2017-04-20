@@ -33,6 +33,8 @@ class AsyncRunner(DiscoverRunner):
             failfast=self.failfast
         ).run(suite)
         state = 'OK ' * result.testsRun
+        if result.skipped:
+            state = 'SKIPPED ' * len(result.skipped)
         if result.failures:
             state = 'F' * len(result.failures)
         if result.errors:

@@ -1,3 +1,4 @@
+# coding: utf-8
 import os
 from optparse import make_option
 from Queue import Empty
@@ -88,9 +89,10 @@ class Consumer(Process):
         # consume suites queue, update results queue
         tasks = 0
         try:
-            for suite in iter(q_suites.get, STOPBIT):
+            while True:
+                suite = q_suites.get(False)
                 result = self.runner.run_suite(suite)
-                if hasattr(result.stream.stream, 'getvalue'):
+                if hasattr(result.stream.stream, 'getvalue'):  # unwrap StringIO if it's that
                     result.stream = result.stream.stream.getvalue()
                 q_results.put((
                     self.pid,
@@ -101,7 +103,12 @@ class Consumer(Process):
                 if max_tasks and tasks >= max_tasks:
                     break
             self.cleanup()
-        except:
+        except Exception as e:
+            q_results.put((
+                self.pid,
+                e.message
+            ))
+            self.join(3)
             self.cleanup()
             raise
 
@@ -130,6 +137,8 @@ class Consumer(Process):
             settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
                 self.pid,
                 settings.CACHES[cc].get('KEY_PREFIX', 'no_cache_prefix'))
+            if 'FileBased' in settings.CACHES[cc]['BACKEND']:
+                settings.CACHES[cc]['LOCATION'] = os.path.join(self.BASEDIR, 'cache', cc)
 
         settings.WORK_DIR = os.path.join(self.BASEDIR, 'work_%s' % self.pid)
         if not os.path.exists(settings.WORK_DIR):
@@ -154,7 +163,16 @@ class Consumer(Process):
 
 
 class Command(BaseCommand):
-    option_list = BaseCommand.option_list + (
+    option_list = (
+        make_option('-v', '--verbosity', action='store', dest='verbosity', default='1',
+            type='choice', choices=map(str, range(6)),
+            help='Verbosity level; 0=minimal output, 1=normal output, 2=verbose output, 3=very verbose output'),
+        make_option('--settings',
+            help='The Python path to a settings module, e.g. "myproject.settings.main". If this isn\'t provided, the DJANGO_SETTINGS_MODULE environment variable will be used.'),
+        make_option('--pythonpath',
+            help='A directory to add to the Python path, e.g. "/home/djangoprojects/myproject".'),
+        make_option('--traceback', action='store_true',
+            help='Raise on exception'),
         make_option('--failfast',
             action='store_true', dest='failfast', default=False,
             help='Tells Django to stop running the test suite after first '
@@ -201,12 +219,6 @@ class Command(BaseCommand):
             logger.removeHandler(handler)
 
     def killall(self):
-        # join() doesn't work at all
-        # print 'Gracefully stopping workers:'
-        # # kill all workers if any or main process failed
-        # for i in self.workers:
-        #     print i.name
-        #     i.join(5)
         self.log(2, 'Killing workers:')
         for i in self.workers:
             if i.is_alive():
@@ -221,9 +233,10 @@ class Command(BaseCommand):
         ww = Consumer(kwargs=self.pargs)
         self.workers.append(ww)
         ww.start()
-        # null-terminate queue and wait for workers to join
-        self.suites_queue.put(STOPBIT)
-        self.tests_done[ww.pid] = dict((('run', 0), ('errs', list()), ('fails', list())))
+        self.tests_done[ww.pid] = dict((('run', 0), ('skipped', 0), ('errors', list()), ('failures', list())))
+
+    def consumer(self, pid):
+        return dict(((x.pid, x) for x in self.workers)).get(pid, None)
 
     def retire_consumers(self):
         self.log(3, 'Max tasks', self.max_tasks)
@@ -266,6 +279,10 @@ class Command(BaseCommand):
         for s in suites:
             self.suites_queue.put(s)
 
+        if not len(suites):
+            print 'No tests discovered. Are your tests on PYTHONPATH?'
+            sys.exit(1)
+
         total = len(suites)
         if self.max_procs > total:
             self.max_procs = total
@@ -294,71 +311,88 @@ class Command(BaseCommand):
             self.launch_consumer()
         # suites_queue.close()
 
+        from blessings import Terminal
+        term = Terminal()
+
         with Bar(label='      ', width=42, expected_size=total) as bar:
-            finished = done = iterations = 0
-            s = '|/-\\'
+            finished = done = skipped = iterations = 0
             pid = cmd = None
             processing = []
             alive = 1
             try:
-                while done < total and alive:
+                while done == 0 or alive:
                     iterations += 1
                     alive = self.alive()
                     if done == 0:
-                        bar.label = '  %s  %s  ' % ('.' * self.max_procs, s[iterations % 4])
+                        s = ',|\'|'
+                        bar.label = ' {}  {} / {}  '.format(
+                            s[iterations % 4],
+                            self.suites_queue.qsize(),
+                            '.' * alive)
                     else:
-                        bar.label = '  {}  {}  '.format(
-                            ' '.join(map(lambda x: str(x['run']), self.tests_done.values())),
-                            s[iterations % 4])
-                    bar.show(done)
-                    if not alive:
-                        self.log(2, '>>> No live workers left!')
-                        raise KeyboardInterrupt('No workers alive')
+                        s = '\X/X'
+                        bar.label = ' {}  {}{} / {}  '.format(
+                            s[iterations % 4],
+                            self.suites_queue.qsize(),
+                            ' ({} skipped)'.format(skipped) if skipped else '',
+                            ' '.join(map(lambda (k, v): str(v['run']) + ('A' if self.consumer(k).is_alive() else 'F'), self.tests_done.items())))
+                    bar.show(done + skipped)
+                    # quit if no workers are alive but there were some tests processed
+                    # if (not alive and total and done) or ((done or skipped) and done + skipped >= total):
+                    #     self.log(2, '>>> No live workers left!')
+                    #     raise KeyboardInterrupt('No workers alive')
+
                     try:
                         pid, cmd = result_queue.get(timeout=0.1)
                         if pid and pid not in processing:
                             processing.append(pid)
                     except Empty:
-                        self.log(5, '>>> skipped a bit', pid, cmd)
+                        self.log(5, '>>> skipped a bit', pid, cmd, alive, done, total)
                         continue
+                    # if self.suites_queue.qsize() == 0 and alive:
+                    if cmd and not hasattr(cmd, 'failures'):
+                        import ipdb; ipdb.set_trace()
                     if cmd == STOPBIT:
                         self.log(4, 'Got STOPBIT')
                         for i in self.workers:
                             if i.pid == pid:
                                 i.join(10)
                         finished += 1
-                    else:
+                    elif cmd:
                         done += cmd.testsRun
+                        skipped += len(cmd.skipped)
                         self.tests_done[pid]['run'] += cmd.testsRun
-                        self.tests_done[pid]['errs'].extend(cmd.errors)
-                        self.tests_done[pid]['fails'].extend(cmd.failures)
-                    # if finished == len(self.workers):
-                    #     print 'Got ALL STOPBITS'
-                    #     break
-                    bar.show(done)
+                        self.tests_done[pid]['skipped'] += len(cmd.skipped)
+                        self.tests_done[pid]['errors'].extend(cmd.errors)
+                        self.tests_done[pid]['failures'].extend(cmd.failures)
+                    bar.show(done + skipped)
                     self.retire_consumers()
-                    bar.show(done)
+                    bar.show(done + skipped)
             except KeyboardInterrupt:
                 print 'Stopping'
             except:
                 self.log(5, 'An exception')
                 self.killall()
                 raise
+            finally:
+                bar.show(done + skipped)
 
         self.killall()
 
         total_tests = 0
+        total_skipped = 0
         total_errs = []
         total_fails = []
         self.log(1, '=' * 70)
         for i, j in enumerate(self.workers):
             self.log(1, 'Worker', i, 'pid', j.pid, 'finished with ', \
                 self.tests_done[j.pid]['run'], 'tests, ', \
-                len(self.tests_done[j.pid]['errs']), 'errors and ', \
-                len(self.tests_done[j.pid]['fails']), 'failures.')
+                len(self.tests_done[j.pid]['errors']), 'errors and ', \
+                len(self.tests_done[j.pid]['failures']), 'failures.')
             total_tests += self.tests_done[j.pid]['run']
-            total_errs.extend(self.tests_done[j.pid]['errs'])
-            total_fails.extend(self.tests_done[j.pid]['fails'])
+            total_skipped += self.tests_done[j.pid]['skipped']
+            total_errs.extend(self.tests_done[j.pid]['errors'])
+            total_fails.extend(self.tests_done[j.pid]['failures'])
 
         for f in (total_fails, total_errs):
             if f:
@@ -368,7 +402,10 @@ class Command(BaseCommand):
                     self.log(1, traceback)
 
         self.log(1, '-' * 70)
+        self.log(1, 'Tests found:', total)
+        self.log(1, 'Tests processed:', total_tests + total_skipped)
         self.log(1, 'Tests run:', total_tests)
+        self.log(1, 'Tests skipped:', total_skipped)
         self.log(1, 'Errors:', len(total_errs))
         self.log(1, 'Failures:', len(total_fails))
         self.log(1, '=' * 70)
