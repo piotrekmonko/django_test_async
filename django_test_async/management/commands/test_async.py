@@ -1,4 +1,5 @@
 # coding: utf-8
+import traceback
 import os
 from optparse import make_option
 from Queue import Empty
@@ -50,19 +51,21 @@ loader._make_failed_load_tests = _make_failed_load_tests
 loader._make_failed_import_test = _make_failed_import_test
 
 
-
 class Consumer(Process):
-    stopping = False
     runner = None
     old_config = None
     settings = None
+    sysout = None
     ROOT = None
     BASEDIR = None
+    interactive = False
 
-    def run(self):
-        q_suites = self._kwargs['suites']
-        q_results = self._kwargs['result']
-        max_tasks = self._kwargs['max_tasks']
+    def pre_run(self):
+        self.sysout = sys.stdout
+        self.interactive = not bool(self.pid)
+        self.q_suites = self._kwargs['suites']
+        self.q_results = self._kwargs['result']
+        self.max_tasks = self._kwargs['max_tasks']
         self.ROOT = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'test_async')
         if not os.path.exists(self.ROOT):
             os.mkdir(self.ROOT)
@@ -79,36 +82,52 @@ class Consumer(Process):
             self.runner.interactive = False
             self.runner.setup_test_environment()
             self.old_config = self.runner.setup_databases()
-        except:
-            print 'Error setting up databases'
+        except Exception as e:
+            self.log(traceback.format_exc())
+            a = ('error setting up databases', e.message)
+            if self.interactive:
+                import ipdb; ipdb.set_trace()
             if 'south' in self.settings.INSTALLED_APPS:
-                print 'Perhaps try without south?'
+                a += (' - perhaps try without south?',)
+            self.log(*a)
             self.cleanup()
-            raise
+            raise e
 
+    def run_one(self):
+        suite = self.q_suites.get(False)
+        # intercept and report testrunner-uncaught exceptions
+        try:
+            result = self.runner.run_suite(suite)
+        except:
+            result = unicode(traceback.format_exc())
+        else:
+            # unwrap StringIO if it's that
+            if hasattr(result.stream.stream, 'getvalue'):
+                result.stream = result.stream.stream.getvalue()
+        self.q_results.put((
+            self.pid,
+            result
+        ))
+        self.q_suites.task_done()
+
+    def run(self):
+        self.pre_run()
         # consume suites queue, update results queue
         tasks = 0
         try:
             while True:
-                suite = q_suites.get(False)
-                result = self.runner.run_suite(suite)
-                if hasattr(result.stream.stream, 'getvalue'):  # unwrap StringIO if it's that
-                    result.stream = result.stream.stream.getvalue()
-                q_results.put((
-                    self.pid,
-                    result
-                ))
-                q_suites.task_done()
+                self.run_one()
                 tasks += 1
-                if max_tasks and tasks >= max_tasks:
+                if self.max_tasks and tasks >= self.max_tasks:
                     break
             self.cleanup()
         except Exception as e:
-            q_results.put((
+            self.q_results.put((
                 self.pid,
                 e.message
             ))
-            self.join(3)
+            if not self.interactive:
+                self.join(3)
             self.cleanup()
             raise
 
@@ -119,8 +138,8 @@ class Consumer(Process):
 
         # alter settings
         from django.conf import settings
-        if 'south' in settings.INSTALLED_APPS:
-            settings.INSTALLED_APPS.remove('south')
+        # if 'south' in settings.INSTALLED_APPS:
+        #     settings.INSTALLED_APPS.remove('south')
 
         dd = settings.DATABASES.dict
         for db in dd:
@@ -153,13 +172,19 @@ class Consumer(Process):
 
     def cleanup(self):
         try:
-            self.runner.teardown_databases(self.old_config)
+            if self.old_config:
+                self.runner.teardown_databases(self.old_config)
             self.runner.teardown_test_environment()
             shutil.rmtree(self.BASEDIR, ignore_errors=True)
         except Exception as e:
-            print self.name, 'cleanup error:', e
+            self.log('cleanup error:', e)
         # mark STOPBIT task as processed too
         self._kwargs['result'].put((self.pid, STOPBIT))
+
+    def log(self, *args):
+        print('{}[{}] {}\033[K'.format(self.name, self.pid, ' '.join(map(unicode, args))))
+        # self.sysout.write('{}[{}] {}\033[K\n'.format(self.name, self.pid, ' '.join(map(unicode, args))))
+        # self.sysout.flush()
 
 
 class Command(BaseCommand):
@@ -177,11 +202,11 @@ class Command(BaseCommand):
             action='store_true', dest='failfast', default=False,
             help='Tells Django to stop running the test suite after first '
                  'failed test.'),
-        make_option('--liveserver',
-            action='store', dest='liveserver', default=None,
-            help='Overrides the default address where the live server (used '
-                 'with LiveServerTestCase) is expected to run from. The '
-                 'default value is localhost:8081.'),
+        # make_option('--liveserver',
+        #     action='store', dest='liveserver', default=None,
+        #     help='Overrides the default address where the live server (used '
+        #          'with LiveServerTestCase) is expected to run from. The '
+        #          'default value is localhost:8081.'),
         make_option('--processes', '-p', action='store', type='int', dest='processes', default=None,
             help='Use this many processes. Defaults to system cpu count.'),
         make_option('--tasks', '-t', action='store', type='int', dest='max_tasks', default=None,
@@ -194,6 +219,8 @@ class Command(BaseCommand):
     workers = []
     max_procs = 0
     max_tasks = 0
+    tasks_revived = 0
+    max_tasks_revived = 4
 
     def __init__(self):
         self.test_runner = None
@@ -201,7 +228,8 @@ class Command(BaseCommand):
 
     def log(self, level, *args):
         if level <= self.verbosity:
-            print ' '.join(map(unicode, args)), '\033[K'
+            print('{}\033[K\r'.format(' '.join(map(unicode, args))))
+            # sys.stdout.flush()
 
     def execute(self, *args, **options):
         if int(options['verbosity']) > 0:
@@ -232,29 +260,48 @@ class Command(BaseCommand):
     def launch_consumer(self):
         ww = Consumer(kwargs=self.pargs)
         self.workers.append(ww)
-        ww.start()
+        if self.max_procs > 1:
+            ww.start()
         self.tests_done[ww.pid] = dict((('run', 0), ('skipped', 0), ('errors', list()), ('failures', list())))
 
     def consumer(self, pid):
         return dict(((x.pid, x) for x in self.workers)).get(pid, None)
 
+    def topup_consumers(self):
+        if self.alive() < self.max_procs:
+            # some worker died, check if there are many tasks left, revive if yes
+            if self.suites_queue.qsize() > self.max_procs * (self.max_tasks or 40):
+                if self.tasks_revived < self.max_tasks_revived:
+                    self.tasks_revived += 1
+                    self.launch_consumer()
+
     def retire_consumers(self):
         self.log(3, 'Max tasks', self.max_tasks)
         if not self.max_tasks:
+            # if no need to retire then just check if all are running
+            self.topup_consumers()
             return
+        alive = self.alive()
         # dont launch new consumers if tasks left can be shared among running consumers
-        self.log(3, 'Tasks left / queue:', self.alive() * self.max_tasks, self.suites_queue.qsize())
-        if self.alive() * self.max_tasks > self.suites_queue.qsize():
+        self.log(3, 'Tasks left / queue:', alive * self.max_tasks, self.suites_queue.qsize())
+        if alive * self.max_tasks > self.suites_queue.qsize():
             return
         # dont launch new consumers if that would exceed allowed processes
-        self.log(3, 'Procs alive / max procs:', self.alive(), self.max_procs)
-        if self.alive() >= self.max_procs:
+        self.log(3, 'Procs alive / max procs:', alive, self.max_procs)
+        if alive >= self.max_procs:
             return
         self.log(3, 'Launching consumer')
         self.launch_consumer()
 
     def alive(self):
         return sum(map(lambda x: x.is_alive(), self.workers))
+
+    def worker_status_display(self, (pid, v)):
+        return '{}{}-{}E'.format(
+            str(v['run']),
+            ('A' if self.consumer(pid).is_alive() else 'D'),
+            len(v['errors']) + len(v['failures'])
+        )
 
     def handle(self, *test_labels, **options):
         # from django.conf import settings
@@ -265,6 +312,7 @@ class Command(BaseCommand):
         self.verbosity = options['verbosity'] = int(options.get('verbosity'))
         self.max_procs = int(options.pop('processes', None) or cpu_count())
         self.max_tasks = options.pop('max_tasks')
+        failfast = options.pop('failfast')
 
         if options.get('liveserver') is not None:
             os.environ['DJANGO_LIVE_TEST_SERVER_ADDRESS'] = options['liveserver']
@@ -276,8 +324,9 @@ class Command(BaseCommand):
 
         # put suites in processing queue
         suites = AsyncRunner(**options).get_suite_list(test_labels, None)
-        for s in suites:
-            self.suites_queue.put(s)
+        self.suites = dict(((x.sid, (x, None)) for x in suites))
+        for k, (v, x) in self.suites:
+            self.suites_queue.put(v)
 
         if not len(suites):
             print 'No tests discovered. Are your tests on PYTHONPATH?'
@@ -296,62 +345,59 @@ class Command(BaseCommand):
             'result': result_queue,
             'max_tasks': self.max_tasks,
         }
-        # single-threaded run
-        if self.max_procs <= 1:
-            self.suites_queue.put(STOPBIT)
-            worker = Consumer(kwargs=self.pargs)
-            worker.run()
-            while worker.is_alive():
-                pid, cmd = result_queue.get(1)
-                print pid, cmd
-            return
 
-        # start workers
+        # single-threaded run
         for i in range(self.max_procs):
             self.launch_consumer()
-        # suites_queue.close()
 
-        from blessings import Terminal
-        term = Terminal()
+        if self.max_procs <= 1:
+            self.workers[0].pre_run()
 
-        with Bar(label='      ', width=42, expected_size=total) as bar:
-            finished = done = skipped = iterations = 0
+        with Bar(label='      ', width=32, expected_size=total) as bar:
+            finished = done = skipped = errors = iterations = 0
             pid = cmd = None
             processing = []
             alive = 1
             try:
-                while done == 0 or alive:
+                # while done == 0 or alive:
+                while alive:
                     iterations += 1
                     alive = self.alive()
+                    qsize = self.suites_queue.qsize()
+                    if self.max_procs <= 1:
+                        self.workers[0].run_one()
+                        alive = qsize
                     if done == 0:
                         s = ',|\'|'
-                        bar.label = ' {}  {} / {}  '.format(
+                        bar.label = ' {}  {} tests queued, {} workers starting up, {} are up'.format(
                             s[iterations % 4],
-                            self.suites_queue.qsize(),
-                            '.' * alive)
+                            qsize,
+                            self.max_procs,
+                            alive)
+                        sys.stderr.write('{}\r'.format(bar.label))
+                        sys.stderr.flush()
                     else:
                         s = '\X/X'
-                        bar.label = ' {}  {}{} / {}  '.format(
+                        bar.label = '  {} {} left, {} running {} [{}]  '.format(
                             s[iterations % 4],
-                            self.suites_queue.qsize(),
-                            ' ({} skipped)'.format(skipped) if skipped else '',
-                            ' '.join(map(lambda (k, v): str(v['run']) + ('A' if self.consumer(k).is_alive() else 'F'), self.tests_done.items())))
-                    bar.show(done + skipped)
+                            qsize,
+                            total - (done + qsize),  # unaccounted for/tests in progress
+                            '({} skipped)'.format(skipped) if skipped else '',
+                            '|'.join(map(self.worker_status_display, self.tests_done.items())))
+                        bar.show(done + skipped)
                     # quit if no workers are alive but there were some tests processed
                     # if (not alive and total and done) or ((done or skipped) and done + skipped >= total):
                     #     self.log(2, '>>> No live workers left!')
                     #     raise KeyboardInterrupt('No workers alive')
 
                     try:
-                        pid, cmd = result_queue.get(timeout=0.1)
+                        pid, cmd = result_queue.get(timeout=0.2)
                         if pid and pid not in processing:
                             processing.append(pid)
                     except Empty:
                         self.log(5, '>>> skipped a bit', pid, cmd, alive, done, total)
                         continue
-                    # if self.suites_queue.qsize() == 0 and alive:
-                    if cmd and not hasattr(cmd, 'failures'):
-                        import ipdb; ipdb.set_trace()
+
                     if cmd == STOPBIT:
                         self.log(4, 'Got STOPBIT')
                         for i in self.workers:
@@ -359,15 +405,18 @@ class Command(BaseCommand):
                                 i.join(10)
                         finished += 1
                     elif cmd:
+                        if not hasattr(cmd, 'failures'):
+                            import ipdb; ipdb.set_trace()
                         done += cmd.testsRun
                         skipped += len(cmd.skipped)
+                        errors += len(cmd.errors) + len(cmd.failures)
                         self.tests_done[pid]['run'] += cmd.testsRun
                         self.tests_done[pid]['skipped'] += len(cmd.skipped)
                         self.tests_done[pid]['errors'].extend(cmd.errors)
                         self.tests_done[pid]['failures'].extend(cmd.failures)
-                    bar.show(done + skipped)
+                    if failfast and errors:
+                        self.killall()
                     self.retire_consumers()
-                    bar.show(done + skipped)
             except KeyboardInterrupt:
                 print 'Stopping'
             except:
@@ -394,10 +443,11 @@ class Command(BaseCommand):
             total_errs.extend(self.tests_done[j.pid]['errors'])
             total_fails.extend(self.tests_done[j.pid]['failures'])
 
-        for f in (total_fails, total_errs):
+        for k, f in zip(('FAILURE:', 'ERROR:'), (total_fails, total_errs)):
             if f:
                 for testsuite, traceback in f:
                     self.log(1, '-' * 70)
+                    self.log(1, k)
                     self.log(1, testsuite)
                     self.log(1, traceback)
 

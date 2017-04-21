@@ -10,6 +10,7 @@ class AsyncRunner(DiscoverRunner):
     def create_suite(self, test):
         ts = TestSuite()
         ts.addTest(test)
+        ts.sid = ts._tests[0].id()
         return ts
 
     def get_suite_list(self, test_labels, extra_tests, **kwargs):
@@ -32,9 +33,9 @@ class AsyncRunner(DiscoverRunner):
             verbosity=self.verbosity,
             failfast=self.failfast
         ).run(suite)
-        state = 'OK ' * result.testsRun
+        state = 'OK'
         if result.skipped:
-            state = 'SKIPPED ' * len(result.skipped)
+            state = 'SKIPPED'
         if result.failures:
             state = 'F' * len(result.failures)
         if result.errors:
