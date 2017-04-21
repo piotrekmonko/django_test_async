@@ -4,7 +4,7 @@ import os
 from optparse import make_option
 from Queue import Empty
 import logging
-from billiard import Process, JoinableQueue, cpu_count, log_to_stderr
+from billiard import Process, JoinableQueue, cpu_count, log_to_stderr, Queue
 from clint.textui.progress import Bar
 from django.core.management.base import BaseCommand
 import sys
@@ -63,6 +63,8 @@ class Consumer(Process):
     def pre_run(self):
         self.sysout = sys.stdout
         self.interactive = not bool(self.pid)
+        if not self.pid:
+            self.boolshitpid = int(self.name.split('-')[1])
         self.q_suites = self._kwargs['suites']
         self.q_results = self._kwargs['result']
         self.max_tasks = self._kwargs['max_tasks']
@@ -94,7 +96,10 @@ class Consumer(Process):
             raise e
 
     def run_one(self):
-        suite = self.q_suites.get(False)
+        try:
+            suite = self.q_suites.get(False)
+        except Empty:
+            return
         # intercept and report testrunner-uncaught exceptions
         try:
             result = self.runner.run_suite(suite)
@@ -104,11 +109,12 @@ class Consumer(Process):
             # unwrap StringIO if it's that
             if hasattr(result.stream.stream, 'getvalue'):
                 result.stream = result.stream.stream.getvalue()
+        import ipdb; ipdb.set_trace()
         self.q_results.put((
-            self.pid,
+            self.pid or self.boolshitpid,
+            suite.sid,
             result
         ))
-        self.q_suites.task_done()
 
     def run(self):
         self.pre_run()
@@ -124,7 +130,7 @@ class Consumer(Process):
         except Exception as e:
             self.q_results.put((
                 self.pid,
-                e.message
+                e.message,
             ))
             if not self.interactive:
                 self.join(3)
@@ -221,6 +227,7 @@ class Command(BaseCommand):
     max_tasks = 0
     tasks_revived = 0
     max_tasks_revived = 4
+    term = None
 
     def __init__(self):
         self.test_runner = None
@@ -232,6 +239,12 @@ class Command(BaseCommand):
             # sys.stdout.flush()
 
     def execute(self, *args, **options):
+        try:
+            from blessings import Terminal
+            self.term = Terminal()
+            self.worker_status_display = self._worker_status_colorized
+        except:
+            pass
         if int(options['verbosity']) > 0:
             # ensure that deprecation warnings are displayed during testing
             # the following state is assumed:
@@ -293,12 +306,30 @@ class Command(BaseCommand):
         self.log(3, 'Launching consumer')
         self.launch_consumer()
 
+    def suites_waiting(self):
+        return filter(lambda x: x[1] is None, self.suites.values())
+
+    def suites_processed(self):
+        return filter(lambda x: x[1] is not None, self.suites.values())
+
     def alive(self):
         return sum(map(lambda x: x.is_alive(), self.workers))
 
+    def _worker_status_colorized(self, (pid, v)):
+        alive = self.consumer(pid).is_alive()
+        ss = '{}{}-{}E'.format(
+            str(v['run'] + v['skipped']),
+            'A' if alive else 'D',
+            len(v['errors']) + len(v['failures'])
+        )
+        if alive:
+            return self.term.green(ss)
+        else:
+            return self.term.red(ss)
+
     def worker_status_display(self, (pid, v)):
         return '{}{}-{}E'.format(
-            str(v['run']),
+            str(v['run'] + v['skipped']),
             ('A' if self.consumer(pid).is_alive() else 'D'),
             len(v['errors']) + len(v['failures'])
         )
@@ -318,14 +349,14 @@ class Command(BaseCommand):
             os.environ['DJANGO_LIVE_TEST_SERVER_ADDRESS'] = options['liveserver']
             del options['liveserver']
 
-        self.suites_queue = JoinableQueue()
-        result_queue = JoinableQueue()
+        self.suites_queue = Queue()
+        result_queue = Queue()
         self.tests_done = {}
 
         # put suites in processing queue
         suites = AsyncRunner(**options).get_suite_list(test_labels, None)
-        self.suites = dict(((x.sid, (x, None)) for x in suites))
-        for k, (v, x) in self.suites:
+        self.suites = dict(((x.sid, list((x, None))) for x in suites))
+        for k, (v, x) in self.suites.items():
             self.suites_queue.put(v)
 
         if not len(suites):
@@ -354,66 +385,84 @@ class Command(BaseCommand):
             self.workers[0].pre_run()
 
         with Bar(label='      ', width=32, expected_size=total) as bar:
-            finished = done = skipped = errors = iterations = 0
-            pid = cmd = None
+            finished = p_done = skipped = errors = iterations = 0
+            pid = None
             processing = []
             alive = 1
             try:
                 # while done == 0 or alive:
-                while alive:
+                while alive or (self.max_procs == 1 and self.suites_queue.qsize() or result_queue.qsize()):
                     iterations += 1
                     alive = self.alive()
                     qsize = self.suites_queue.qsize()
+                    p_waiting = len(self.suites_waiting())
+                    p_done = len(self.suites_processed())
                     if self.max_procs <= 1:
                         self.workers[0].run_one()
                         alive = qsize
-                    if done == 0:
+                    if p_done == 0:
                         s = ',|\'|'
-                        bar.label = ' {}  {} tests queued, {} workers starting up, {} are up'.format(
+                        bar.label = ' {}  {} tests queued, {} workers starting up, {} are up, result_queue is {}.'.format(
                             s[iterations % 4],
                             qsize,
                             self.max_procs,
-                            alive)
-                        sys.stderr.write('{}\r'.format(bar.label))
+                            alive,
+                            result_queue.qsize())
+                        print('{}\r'.format(bar.label))
                         sys.stderr.flush()
                     else:
                         s = '\X/X'
-                        bar.label = '  {} {} left, {} running {} [{}]  '.format(
-                            s[iterations % 4],
-                            qsize,
-                            total - (done + qsize),  # unaccounted for/tests in progress
-                            '({} skipped)'.format(skipped) if skipped else '',
-                            '|'.join(map(self.worker_status_display, self.tests_done.items())))
-                        bar.show(done + skipped)
+                        bar.label = '  {MARK} T{TOTL} W{WAIT} D{DONE} S{SKIP} P{PRCS} [{FLGS}]  '.format(
+                            MARK=s[iterations % 4],
+                            TOTL=len(self.suites.keys()),  # unaccounted for/tests in progress
+                            WAIT=p_waiting,
+                            DONE=p_done,
+                            SKIP=skipped,
+                            PRCS=p_waiting - qsize,
+                            FLGS='|'.join(map(self.worker_status_display, self.tests_done.items())))
+                        bar.show(p_done + skipped)
                     # quit if no workers are alive but there were some tests processed
                     # if (not alive and total and done) or ((done or skipped) and done + skipped >= total):
                     #     self.log(2, '>>> No live workers left!')
                     #     raise KeyboardInterrupt('No workers alive')
 
                     try:
-                        pid, cmd = result_queue.get(timeout=0.2)
+                        pid = testId = testResult = response_error = None
+                        response_body = result_queue.get(block=False)
+                        if type(response_body) is not tuple:
+                            import ipdb; ipdb.set_trace()
+                        if len(response_body) == 2:
+                            pid, response_error = response_body
+                        elif len(response_body) == 3:
+                            pid, testId, testResult = response_body
+                        else:
+                            import ipdb; ipdb.set_trace()
                         if pid and pid not in processing:
                             processing.append(pid)
                     except Empty:
-                        self.log(5, '>>> skipped a bit', pid, cmd, alive, done, total)
+                        self.log(5, '>>> skipped a bit', pid, alive, p_done, total)
+                        time.sleep(0.2)
                         continue
 
-                    if cmd == STOPBIT:
+                    if testId == STOPBIT:
                         self.log(4, 'Got STOPBIT')
                         for i in self.workers:
                             if i.pid == pid:
                                 i.join(10)
                         finished += 1
-                    elif cmd:
-                        if not hasattr(cmd, 'failures'):
+                    elif testId and testResult:
+                        self.suites[testId][1] = testResult
+                        if not hasattr(testResult, 'failures'):
                             import ipdb; ipdb.set_trace()
-                        done += cmd.testsRun
-                        skipped += len(cmd.skipped)
-                        errors += len(cmd.errors) + len(cmd.failures)
-                        self.tests_done[pid]['run'] += cmd.testsRun
-                        self.tests_done[pid]['skipped'] += len(cmd.skipped)
-                        self.tests_done[pid]['errors'].extend(cmd.errors)
-                        self.tests_done[pid]['failures'].extend(cmd.failures)
+                        skipped += len(testResult.skipped)
+                        errors += len(testResult.errors) + len(testResult.failures)
+                        self.tests_done[pid]['run'] += testResult.testsRun
+                        self.tests_done[pid]['skipped'] += len(testResult.skipped)
+                        self.tests_done[pid]['errors'].extend(testResult.errors)
+                        self.tests_done[pid]['failures'].extend(testResult.failures)
+                    elif response_error:
+                        self.tests_done[pid]['run'] += 1
+                        self.tests_done[pid]['errors'].append(response_error)
                     if failfast and errors:
                         self.killall()
                     self.retire_consumers()
@@ -424,7 +473,7 @@ class Command(BaseCommand):
                 self.killall()
                 raise
             finally:
-                bar.show(done + skipped)
+                bar.show(p_done + skipped)
 
         self.killall()
 
@@ -445,11 +494,17 @@ class Command(BaseCommand):
 
         for k, f in zip(('FAILURE:', 'ERROR:'), (total_fails, total_errs)):
             if f:
-                for testsuite, traceback in f:
+                for testsuite, tb in f:
                     self.log(1, '-' * 70)
                     self.log(1, k)
                     self.log(1, testsuite)
-                    self.log(1, traceback)
+                    self.log(1, tb)
+
+        still_waiting = self.suites_waiting()
+        if len(still_waiting):
+            print 'Still waiting for:'
+            for p in still_waiting:
+                print p
 
         self.log(1, '-' * 70)
         self.log(1, 'Tests found:', total)
