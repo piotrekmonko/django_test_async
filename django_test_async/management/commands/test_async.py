@@ -1,196 +1,19 @@
 # coding: utf-8
-import traceback
 import os
 from optparse import make_option
 from Queue import Empty
 import logging
-from billiard import Process, JoinableQueue, cpu_count, log_to_stderr, Queue
+from billiard import cpu_count, log_to_stderr, Queue
 from clint.textui.progress import Bar
 from django.core.management.base import BaseCommand
 import sys
-from unittest import loader, TestCase
 import time
-import shutil
+from django_test_async.const import COLOR_SHIFT, STOPBIT
+from django_test_async.test_runner import Consumer
 
 
 mpl = log_to_stderr()
 mpl.setLevel(logging.INFO)
-
-STOPBIT = 0xffff
-
-
-class _FailedTest(TestCase):
-    _testMethodName = None
-
-    def __init__(self, method_name, exception):
-        self._exception = exception
-        super(_FailedTest, self).__init__(method_name)
-
-    def __getattr__(self, name):
-        if name != self._testMethodName:
-            return super(_FailedTest, self).__getattr__(name)
-
-        def testFailure():
-            raise self._exception
-        return testFailure
-
-
-def _make_failed_import_test(name, suiteClass):
-    message = 'Failed to import test module: %s' % name
-    test = _FailedTest(name, ImportError(message))
-    return suiteClass((test,))
-
-
-def _make_failed_load_tests(name, exception, suiteClass):
-    test = _FailedTest(name, exception)
-    return suiteClass((test,))
-
-
-# patch testLoader to make it pickable
-loader._make_failed_load_tests = _make_failed_load_tests
-loader._make_failed_import_test = _make_failed_import_test
-
-
-class Consumer(Process):
-    runner = None
-    old_config = None
-    settings = None
-    sysout = None
-    ROOT = None
-    BASEDIR = None
-    interactive = False
-
-    def pre_run(self):
-        self.sysout = sys.stdout
-        self.interactive = not bool(self.pid)
-        if not self.pid:
-            self.boolshitpid = int(self.name.split('-')[1])
-        self.q_suites = self._kwargs['suites']
-        self.q_results = self._kwargs['result']
-        self.max_tasks = self._kwargs['max_tasks']
-        self.ROOT = os.path.join(os.environ.get('XDG_RUNTIME_DIR'), 'test_async')
-        if not os.path.exists(self.ROOT):
-            os.mkdir(self.ROOT)
-        self.BASEDIR = os.path.join(self.ROOT, 'pid_%s' % self.pid or 'mainprocess')
-        if not os.path.exists(self.BASEDIR):
-            os.mkdir(self.BASEDIR)
-
-        self.apply_patches()
-
-        # prepare environment and databases, abort tests on any errors
-        from django_test_async.test_runner import AsyncRunner
-        try:
-            self.runner = AsyncRunner(**self._kwargs['opts'])
-            self.runner.interactive = False
-            self.runner.setup_test_environment()
-            self.old_config = self.runner.setup_databases()
-        except Exception as e:
-            self.log(traceback.format_exc())
-            a = ('error setting up databases', e.message)
-            if self.interactive:
-                import ipdb; ipdb.set_trace()
-            if 'south' in self.settings.INSTALLED_APPS:
-                a += (' - perhaps try without south?',)
-            self.log(*a)
-            self.cleanup()
-            raise e
-
-    def run_one(self):
-        try:
-            suite = self.q_suites.get(False)
-        except Empty:
-            return
-        # intercept and report testrunner-uncaught exceptions
-        try:
-            result = self.runner.run_suite(suite)
-        except:
-            result = unicode(traceback.format_exc())
-        else:
-            # unwrap StringIO if it's that
-            if hasattr(result.stream.stream, 'getvalue'):
-                result.stream = result.stream.stream.getvalue()
-        import ipdb; ipdb.set_trace()
-        self.q_results.put((
-            self.pid or self.boolshitpid,
-            suite.sid,
-            result
-        ))
-
-    def run(self):
-        self.pre_run()
-        # consume suites queue, update results queue
-        tasks = 0
-        try:
-            while True:
-                self.run_one()
-                tasks += 1
-                if self.max_tasks and tasks >= self.max_tasks:
-                    break
-            self.cleanup()
-        except Exception as e:
-            self.q_results.put((
-                self.pid,
-                e.message,
-            ))
-            if not self.interactive:
-                self.join(3)
-            self.cleanup()
-            raise
-
-    def apply_patches(self):
-        # patch testLoader to make it pickable
-        loader._make_failed_load_tests = _make_failed_load_tests
-        loader._make_failed_import_test = _make_failed_import_test
-
-        # alter settings
-        from django.conf import settings
-        # if 'south' in settings.INSTALLED_APPS:
-        #     settings.INSTALLED_APPS.remove('south')
-
-        dd = settings.DATABASES.dict
-        for db in dd:
-            settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
-            settings.DATABASES[db]['TEST_NAME'] = os.path.join(
-                self.BASEDIR,
-                'db_{}_{}'.format(
-                    self.pid or 'mainprocess',
-                    dd[db].get('TEST_NAME', 'notestname')
-                )
-            )
-
-        for cc in settings.CACHES:
-            settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
-                self.pid,
-                settings.CACHES[cc].get('KEY_PREFIX', 'no_cache_prefix'))
-            if 'FileBased' in settings.CACHES[cc]['BACKEND']:
-                settings.CACHES[cc]['LOCATION'] = os.path.join(self.BASEDIR, 'cache', cc)
-
-        settings.WORK_DIR = os.path.join(self.BASEDIR, 'work_%s' % self.pid)
-        if not os.path.exists(settings.WORK_DIR):
-            os.mkdir(settings.WORK_DIR)
-        settings.NFS_SHARED_DIR = os.path.join(settings.WORK_DIR, 'shared')
-        if not os.path.exists(settings.NFS_SHARED_DIR):
-            os.mkdir(settings.NFS_SHARED_DIR)
-        settings.TENANT_DIR = os.path.join(settings.WORK_DIR, 'tenant')
-        if not os.path.exists(settings.TENANT_DIR):
-            os.mkdir(settings.TENANT_DIR)
-        self.settings = settings
-
-    def cleanup(self):
-        try:
-            if self.old_config:
-                self.runner.teardown_databases(self.old_config)
-            self.runner.teardown_test_environment()
-            shutil.rmtree(self.BASEDIR, ignore_errors=True)
-        except Exception as e:
-            self.log('cleanup error:', e)
-        # mark STOPBIT task as processed too
-        self._kwargs['result'].put((self.pid, STOPBIT))
-
-    def log(self, *args):
-        print('{}[{}] {}\033[K'.format(self.name, self.pid, ' '.join(map(unicode, args))))
-        # self.sysout.write('{}[{}] {}\033[K\n'.format(self.name, self.pid, ' '.join(map(unicode, args))))
-        # self.sysout.flush()
 
 
 class Command(BaseCommand):
@@ -199,7 +22,8 @@ class Command(BaseCommand):
             type='choice', choices=map(str, range(6)),
             help='Verbosity level; 0=minimal output, 1=normal output, 2=verbose output, 3=very verbose output'),
         make_option('--settings',
-            help='The Python path to a settings module, e.g. "myproject.settings.main". If this isn\'t provided, the DJANGO_SETTINGS_MODULE environment variable will be used.'),
+            help='The Python path to a settings module, e.g. "myproject.settings.main". If this isn\'t provided, '
+                 'the DJANGO_SETTINGS_MODULE environment variable will be used.'),
         make_option('--pythonpath',
             help='A directory to add to the Python path, e.g. "/home/djangoprojects/myproject".'),
         make_option('--traceback', action='store_true',
@@ -218,16 +42,22 @@ class Command(BaseCommand):
         make_option('--tasks', '-t', action='store', type='int', dest='max_tasks', default=None,
             help='Kill worker after this many processed tasks.'),
     )
-    help = ('Discover and run tests in the specified modules or the current directory.')
+    help = 'Discover and run tests asynchronously in the specified modules or the current directory.'
     args = '[path.to.modulename|path.to.modulename.TestCase|path.to.modulename.TestCase.test_method]...'
 
     requires_model_validation = False
     workers = []
     max_procs = 0
     max_tasks = 0
+    verbosity = 0
     tasks_revived = 0
     max_tasks_revived = 4
     term = None
+    pargs = None
+    suites = None
+    tests_done = None
+    suites_queue = None
+    global_errors = None
 
     def __init__(self):
         self.test_runner = None
@@ -275,10 +105,11 @@ class Command(BaseCommand):
         self.workers.append(ww)
         if self.max_procs > 1:
             ww.start()
-        self.tests_done[ww.pid] = dict((('run', 0), ('skipped', 0), ('errors', list()), ('failures', list())))
+        self.tests_done[ww.boolshitpid()] = dict((('run', 0), ('skipped', 0), ('errors', 0), ('failures', 0)))
 
     def consumer(self, pid):
-        return dict(((x.pid, x) for x in self.workers)).get(pid, None)
+        dic_workers = dict(((x.boolshitpid(), x) for x in self.workers))
+        return dic_workers.get(pid, None)
 
     def topup_consumers(self):
         if self.alive() < self.max_procs:
@@ -290,13 +121,15 @@ class Command(BaseCommand):
 
     def retire_consumers(self):
         self.log(3, 'Max tasks', self.max_tasks)
-        if not self.max_tasks:
+        if not self.max_tasks and self.max_procs > 1:
             # if no need to retire then just check if all are running
             self.topup_consumers()
             return
+        if not self.max_tasks:
+            return
         alive = self.alive()
         # dont launch new consumers if tasks left can be shared among running consumers
-        self.log(3, 'Tasks left / queue:', alive * self.max_tasks, self.suites_queue.qsize())
+        self.log(3, 'Tasks left / queue:', alive * self.max_tasks or 0, self.suites_queue.qsize())
         if alive * self.max_tasks > self.suites_queue.qsize():
             return
         # dont launch new consumers if that would exceed allowed processes
@@ -312,27 +145,35 @@ class Command(BaseCommand):
     def suites_processed(self):
         return filter(lambda x: x[1] is not None, self.suites.values())
 
+    def suites_errors(self):
+        return filter(lambda (x, y): y['errors'] or y['failures'], self.suites.values())
+
     def alive(self):
         return sum(map(lambda x: x.is_alive(), self.workers))
 
     def _worker_status_colorized(self, (pid, v)):
-        alive = self.consumer(pid).is_alive()
-        ss = '{}{}-{}E'.format(
-            str(v['run'] + v['skipped']),
+        cons = self.consumer(pid)
+        alive = cons.is_alive()
+        ss = '{}{}s{}-{}E'.format(
             'A' if alive else 'D',
-            len(v['errors']) + len(v['failures'])
+            v['run'],
+            v['skipped'],
+            v['errors'] + v['failures']
         )
-        if alive:
-            return self.term.green(ss)
-        else:
-            return self.term.red(ss)
+        return self.term.color(cons.consumer_id() + COLOR_SHIFT)(ss)
 
     def worker_status_display(self, (pid, v)):
-        return '{}{}-{}E'.format(
-            str(v['run'] + v['skipped']),
+        return '{}{}s{}-{}E'.format(
             ('A' if self.consumer(pid).is_alive() else 'D'),
-            len(v['errors']) + len(v['failures'])
+            v['run'],
+            v['skipped'],
+            v['errors'] + v['failures']
         )
+
+    def push_waiting_suites(self):
+        for (v, x) in self.suites_waiting()[:10]:
+            self.log(1, 'Repushing a test:', unicode(v))
+            self.suites_queue.put(v)
 
     def handle(self, *test_labels, **options):
         # from django.conf import settings
@@ -352,6 +193,7 @@ class Command(BaseCommand):
         self.suites_queue = Queue()
         result_queue = Queue()
         self.tests_done = {}
+        self.global_errors = {}
 
         # put suites in processing queue
         suites = AsyncRunner(**options).get_suite_list(test_labels, None)
@@ -385,133 +227,160 @@ class Command(BaseCommand):
             self.workers[0].pre_run()
 
         with Bar(label='      ', width=32, expected_size=total) as bar:
-            finished = p_done = skipped = errors = iterations = 0
+            p_done = skipped = errors = iterations = 0
             pid = None
-            processing = []
             alive = 1
             try:
                 # while done == 0 or alive:
-                while alive or (self.max_procs == 1 and self.suites_queue.qsize() or result_queue.qsize()):
+                # while alive or (self.max_procs == 1 and self.suites_queue.qsize() or result_queue.qsize()):
+                while alive or (self.suites_queue.qsize() or result_queue.qsize()):
                     iterations += 1
                     alive = self.alive()
                     qsize = self.suites_queue.qsize()
+                    rsize = result_queue.qsize()
                     p_waiting = len(self.suites_waiting())
                     p_done = len(self.suites_processed())
+                    for w in self.workers:
+                        if not w.is_alive() and w.pid:
+                            self.log(1, 'joining worker', w.boolshitpid())
+                            w.join(0.1)
+                    if not p_waiting and not rsize:
+                        self.log(1, 'quiting: no waiting and no rsize')
+                        break
+                    # if not rsize and not qsize and p_waiting:
+                    #     self.push_waiting_suites()
                     if self.max_procs <= 1:
                         self.workers[0].run_one()
                         alive = qsize
                     if p_done == 0:
                         s = ',|\'|'
-                        bar.label = ' {}  {} tests queued, {} workers starting up, {} are up, result_queue is {}.'.format(
+                        bar.label = ' {} {} queued, {} workers starting up, {} are up, result_queue is {}.'.format(
                             s[iterations % 4],
                             qsize,
                             self.max_procs,
                             alive,
                             result_queue.qsize())
-                        print('{}\r'.format(bar.label))
+                        sys.stderr.write('{}\r'.format(bar.label))
                         sys.stderr.flush()
                     else:
                         s = '\X/X'
-                        bar.label = '  {MARK} T{TOTL} W{WAIT} D{DONE} S{SKIP} P{PRCS} [{FLGS}]  '.format(
+                        bar.label = '  {MARK} {AA}/{BB} T{TOTL} W{WAIT} D{DONE} S{SKIP} P{PRCS} [{FLGS}] '.format(
                             MARK=s[iterations % 4],
+                            AA=self.suites_queue.qsize(),
+                            BB=result_queue.qsize(),
                             TOTL=len(self.suites.keys()),  # unaccounted for/tests in progress
                             WAIT=p_waiting,
                             DONE=p_done,
                             SKIP=skipped,
                             PRCS=p_waiting - qsize,
                             FLGS='|'.join(map(self.worker_status_display, self.tests_done.items())))
-                        bar.show(p_done + skipped)
+                        bar.show(p_done)
                     # quit if no workers are alive but there were some tests processed
                     # if (not alive and total and done) or ((done or skipped) and done + skipped >= total):
                     #     self.log(2, '>>> No live workers left!')
                     #     raise KeyboardInterrupt('No workers alive')
 
                     try:
-                        pid = testId = testResult = response_error = None
-                        response_body = result_queue.get(block=False)
+                        pid = test_id = test_result = response_error = None
+                        response_body = result_queue.get(timeout=0.2)
                         if type(response_body) is not tuple:
-                            import ipdb; ipdb.set_trace()
+                            print response_body
+                            raise Exception('Uncomprehensible response from consumer')
                         if len(response_body) == 2:
                             pid, response_error = response_body
                         elif len(response_body) == 3:
-                            pid, testId, testResult = response_body
-                        else:
-                            import ipdb; ipdb.set_trace()
-                        if pid and pid not in processing:
-                            processing.append(pid)
+                            pid, test_id, test_result = response_body
                     except Empty:
                         self.log(5, '>>> skipped a bit', pid, alive, p_done, total)
                         time.sleep(0.2)
                         continue
 
-                    if testId == STOPBIT:
+                    if test_id == STOPBIT:
                         self.log(4, 'Got STOPBIT')
                         for i in self.workers:
-                            if i.pid == pid:
+                            if i.boolshitpid() == pid:
                                 i.join(10)
-                        finished += 1
-                    elif testId and testResult:
-                        self.suites[testId][1] = testResult
-                        if not hasattr(testResult, 'failures'):
-                            import ipdb; ipdb.set_trace()
-                        skipped += len(testResult.skipped)
-                        errors += len(testResult.errors) + len(testResult.failures)
-                        self.tests_done[pid]['run'] += testResult.testsRun
-                        self.tests_done[pid]['skipped'] += len(testResult.skipped)
-                        self.tests_done[pid]['errors'].extend(testResult.errors)
-                        self.tests_done[pid]['failures'].extend(testResult.failures)
+                    elif test_id and test_result:
+                        if test_id in self.suites:
+                            self.suites[test_id][1] = test_result
+                        else:
+                            if pid not in self.global_errors:
+                                self.global_errors[pid] = []
+                            self.global_errors[pid].append(test_result)
+                        skipped += test_result['skipped']
+
+                        self.tests_done[pid]['run'] += 1
+                        self.tests_done[pid]['skipped'] += test_result['skipped']
+                        if test_result['errors']:
+                            self.tests_done[pid]['errors'] += 1
+                        if test_result['failures']:
+                            self.tests_done[pid]['failures'] += 1
                     elif response_error:
                         self.tests_done[pid]['run'] += 1
                         self.tests_done[pid]['errors'].append(response_error)
-                    if failfast and errors:
+                    if failfast and (test_result['errors'] or test_result['failures']):
+                        self.log(1, 'quiting: failfast on errors')
                         self.killall()
                     self.retire_consumers()
             except KeyboardInterrupt:
                 print 'Stopping'
             except:
-                self.log(5, 'An exception')
+                self.log(1, 'quitiing: an exception')
                 self.killall()
                 raise
             finally:
-                bar.show(p_done + skipped)
+                bar.show(p_done)
 
         self.killall()
 
         total_tests = 0
         total_skipped = 0
-        total_errs = []
-        total_fails = []
+        total_errs = 0
+        total_fails = 0
         self.log(1, '=' * 70)
         for i, j in enumerate(self.workers):
-            self.log(1, 'Worker', i, 'pid', j.pid, 'finished with ', \
-                self.tests_done[j.pid]['run'], 'tests, ', \
-                len(self.tests_done[j.pid]['errors']), 'errors and ', \
-                len(self.tests_done[j.pid]['failures']), 'failures.')
-            total_tests += self.tests_done[j.pid]['run']
-            total_skipped += self.tests_done[j.pid]['skipped']
-            total_errs.extend(self.tests_done[j.pid]['errors'])
-            total_fails.extend(self.tests_done[j.pid]['failures'])
+            bid = j.boolshitpid()
+            self.log(1,
+                'Worker', i, 'pid', j.pid, 'finished with ',
+                self.tests_done[bid]['run'], 'tests, ',
+                self.tests_done[bid]['errors'], 'errors and ',
+                self.tests_done[bid]['failures'], 'failures.')
+            total_tests += self.tests_done[bid]['run']
+            total_skipped += self.tests_done[bid]['skipped']
+            total_errs += self.tests_done[bid]['errors']
+            total_fails += self.tests_done[bid]['failures']
 
-        for k, f in zip(('FAILURE:', 'ERROR:'), (total_fails, total_errs)):
-            if f:
-                for testsuite, tb in f:
-                    self.log(1, '-' * 70)
-                    self.log(1, k)
-                    self.log(1, testsuite)
-                    self.log(1, tb)
+        for tst, statedict in self.suites_errors():
+            if statedict['errors']:
+                self.log(1, '=' * 70)
+                self.log(1, 'ERROR:', tst.sid)
+                self.log(1, tst._tests[0].shortDescription())
+                self.log(1, '-' * 70)
+                self.log(1, statedict['errors'])
+                self.log(1, 'ERROR', tst.sid)
+            if statedict['failures']:
+                self.log(1, '=' * 70)
+                self.log(1, 'FAILURE:', tst.sid)
+                self.log(1, tst._tests[0].shortDescription())
+                self.log(1, '-' * 70)
+                self.log(1, statedict['failures'])
+                self.log(1, 'FAILURE:', tst.sid)
 
         still_waiting = self.suites_waiting()
         if len(still_waiting):
-            print 'Still waiting for:'
-            for p in still_waiting:
-                print p
+            self.log(1, 'Still waiting for', len(still_waiting), 'tests')
 
-        self.log(1, '-' * 70)
+        for name, errlist in self.global_errors.items():
+            self.log(1, 'GLOBALERROR:', name)
+            for ee in errlist:
+                self.log(1, ee)
+                self.log(1, '-' * 70)
+
+        self.log(1, '=' * 70)
         self.log(1, 'Tests found:', total)
-        self.log(1, 'Tests processed:', total_tests + total_skipped)
         self.log(1, 'Tests run:', total_tests)
         self.log(1, 'Tests skipped:', total_skipped)
-        self.log(1, 'Errors:', len(total_errs))
-        self.log(1, 'Failures:', len(total_fails))
+        self.log(1, 'Errors:', total_errs)
+        self.log(1, 'Failures:', total_fails)
         self.log(1, '=' * 70)
         sys.exit(0)
