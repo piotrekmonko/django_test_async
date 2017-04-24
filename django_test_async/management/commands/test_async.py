@@ -242,7 +242,7 @@ class Command(BaseCommand):
                     p_done = len(self.suites_processed())
                     for w in self.workers:
                         if not w.is_alive() and w.pid:
-                            self.log(1, 'joining worker', w.boolshitpid())
+                            self.log(2, 'joining worker', w.boolshitpid())
                             w.join(0.1)
                     if not p_waiting and not rsize:
                         self.log(1, 'quiting: no waiting and no rsize')
@@ -317,7 +317,10 @@ class Command(BaseCommand):
                             self.tests_done[pid]['failures'] += 1
                     elif response_error:
                         self.tests_done[pid]['run'] += 1
-                        self.tests_done[pid]['errors'].append(response_error)
+                        self.tests_done[pid]['errors'] += 1
+                        if pid not in self.global_errors:
+                            self.global_errors[pid] = []
+                        self.global_errors[pid].append(response_error)
                     if failfast and (test_result['errors'] or test_result['failures']):
                         self.log(1, 'quiting: failfast on errors')
                         self.killall()

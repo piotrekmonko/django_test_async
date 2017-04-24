@@ -2,8 +2,12 @@ from Queue import Empty
 import traceback
 from billiard import Process
 from django.test.runner import DiscoverRunner
-from django.utils.unittest.runner import TextTestRunner
-from django.utils.unittest.suite import TestSuite
+try:
+    from django.utils.unittest.runner import TextTestRunner
+    from django.utils.unittest.suite import TestSuite
+except ImportError:
+    from unittest.runner import TextTestRunner
+    from unittest.suite import TestSuite
 from cStringIO import StringIO
 import sys
 import shutil
@@ -127,7 +131,6 @@ class Consumer(Process):
         self.apply_patches()
 
         # prepare environment and databases, abort tests on any errors
-        from django_test_async.test_runner import AsyncRunner
         try:
             self.runner = AsyncRunner(**self._kwargs['opts'])
             self.runner.interactive = False
@@ -136,10 +139,10 @@ class Consumer(Process):
         except Exception as e:
             self.log(traceback.format_exc())
             a = ('error setting up databases', e.message)
-            if self.interactive:
-                import ipdb; ipdb.set_trace()
             if 'south' in self.settings.INSTALLED_APPS:
                 a += (' - perhaps try without south?',)
+            if self.interactive:
+                import ipdb; ipdb.set_trace()
             self.log(*a)
             self.cleanup()
             raise e
@@ -191,26 +194,45 @@ class Consumer(Process):
             raise
         sys.exit(0)
 
+    def setup_db(self, db):
+        if db not in self.settings.DATABASES:
+            self.settings.DATABASES[db] = {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': '',
+            }
+
+        if 'transaction_hooks' in self.settings.DATABASES[db]['ENGINE']:
+            self.settings.DATABASES[db]['ENGINE'] = 'transaction_hooks.backends.sqlite3'
+        else:
+            self.settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
+
+        self.settings.DATABASES[db]['TEST_NAME'] = os.path.join(
+            self.BASEDIR,
+            'db_{}_{}'.format(
+                self.boolshitpid(),
+                self.settings.DATABASES[db].get('TEST_NAME', 'notestname')
+            )
+        )
+        if not self.settings.DATABASES[db]['NAME']:
+            self.settings.DATABASES[db]['NAME'] = os.path.join(
+                self.BASEDIR,
+                'db_{}'.format(self.boolshitpid())
+            )
+
     def apply_patches(self):
         # patch testLoader to make it pickable
         patch_loader()
 
         # alter settings
         from django.conf import settings
+        from django import VERSION
+        is_17 = VERSION[0] == 1 and VERSION[1] == 7
 
-        DD = settings.DATABASES.dict
-        for db in DD:
-            if 'transaction_hooks' in DD[db]['ENGINE']:
-                settings.DATABASES[db]['ENGINE'] = 'transaction_hooks.backends.sqlite3'
-            else:
-                settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
-            settings.DATABASES[db]['TEST_NAME'] = os.path.join(
-                self.BASEDIR,
-                'db_{}_{}'.format(
-                    self.boolshitpid(),
-                    DD[db].get('TEST_NAME', 'notestname')
-                )
-            )
+        self.settings = settings
+        for db in settings.DATABASES:
+            self.setup_db(db)
+        if is_17:
+            self.setup_db('TEST')
 
         for cc in settings.CACHES:
             settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
