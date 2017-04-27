@@ -8,7 +8,7 @@ from clint.textui.progress import Bar
 from django.core.management.base import BaseCommand
 import sys
 import time
-from django_test_async.const import COLOR_SHIFT, STOPBIT
+from django_test_async.const import STOPBIT, colorized
 from django_test_async.test_runner import Consumer
 
 
@@ -160,7 +160,7 @@ class Command(BaseCommand):
             v['skipped'],
             v['errors'] + v['failures']
         )
-        return self.term.color(cons.consumer_id() + COLOR_SHIFT)(ss)
+        return colorized(cons.consumer_id(), ss)
 
     def worker_status_display(self, (pid, v)):
         return '{}{}s{}-{}E'.format(

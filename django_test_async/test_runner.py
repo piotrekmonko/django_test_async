@@ -12,7 +12,7 @@ from cStringIO import StringIO
 import sys
 import shutil
 import os
-from django_test_async.const import COLOR_SHIFT, STOPBIT
+from django_test_async.const import STOPBIT, colorized
 from unittest import loader, TestCase
 
 
@@ -72,18 +72,10 @@ class AsyncRunner(DiscoverRunner):
         self.teardown_test_environment()
         return self.suite_result(suite, result)
 
-    def ppp(self, s):
-        try:
-            from blessings import Terminal
-            term = Terminal()
-            print term.color(self.cons_id + COLOR_SHIFT)(u'{}\033[K'.format(s))
-        except:
-            print u'{} {}\033[K'.format(self.cons_id, s)
-
     def run_suite(self, suite, consumer_id, **kwargs):
         self.cons_id = consumer_id
         stream = sys.stderr if self.verbosity and self.verbosity > 1 else StringIO()
-        self.ppp(u' > {}'.format(suite._tests[0].id()))
+        print colorized(consumer_id, u' > {}\033[K'.format(suite._tests[0].id()))
         result = TextTestRunner(
             stream=stream,
             verbosity=self.verbosity,
@@ -96,7 +88,7 @@ class AsyncRunner(DiscoverRunner):
             state = 'F' * len(result.failures)
         if result.errors:
             state = 'E' * len(result.errors)
-        self.ppp(u'{} {}'.format(state, suite._tests[0].id()))
+        print colorized(consumer_id, u'{} {}\033[K'.format(state, suite._tests[0].id()))
         return result
 
 
