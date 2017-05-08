@@ -1,4 +1,5 @@
 from Queue import Empty
+from collections import namedtuple
 import traceback
 from billiard import Process
 from django.test.runner import DiscoverRunner
@@ -51,6 +52,9 @@ def patch_loader():
 patch_loader()
 
 
+FakeResult = namedtuple('FakeResult', ['testsRun', 'skipped', 'errors', 'failures'])
+
+
 class AsyncRunner(DiscoverRunner):
 
     def create_suite(self, test):
@@ -72,14 +76,25 @@ class AsyncRunner(DiscoverRunner):
         self.teardown_test_environment()
         return self.suite_result(suite, result)
 
-    def run_suite(self, suite, consumer_id, **kwargs):
+    def run_suite(self, suite, consumer_id, do_debug=False, **kwargs):
         self.cons_id = consumer_id
         stream = sys.stderr if self.verbosity and self.verbosity > 1 else StringIO()
         print colorized(consumer_id, u' > {}\033[K'.format(suite._tests[0].id()))
+
+        if do_debug:
+            suite.debug()
+            return FakeResult(
+                testsRun=1,
+                skipped=[],
+                errors=[],
+                failures=[]
+            )
+
         result = TextTestRunner(
             stream=stream,
             verbosity=self.verbosity,
-            failfast=self.failfast
+            failfast=self.failfast,
+            buffer=True
         ).run(suite)
         state = 'OK'
         if result.skipped:
@@ -100,6 +115,7 @@ class Consumer(Process):
     ROOT = None
     BASEDIR = None
     interactive = False
+    debug = False
 
     def consumer_id(self):
         return int(self.name.split('-')[1])
@@ -110,6 +126,7 @@ class Consumer(Process):
     def pre_run(self):
         self.sysout = sys.stdout
         self.interactive = not bool(self.pid)
+        self.debug = self._kwargs['opts'].get('debug', False)
         self.q_suites = self._kwargs['suites']
         self.q_results = self._kwargs['result']
         self.max_tasks = self._kwargs['max_tasks']
@@ -146,14 +163,19 @@ class Consumer(Process):
             sys.exit(0)
         # intercept and report testrunner-uncaught exceptions
         try:
-            result = self.runner.run_suite(suite, self.consumer_id())
+            result = self.runner.run_suite(suite, self.consumer_id(), do_debug=self.debug)
         except:
-            result = {
-                'testsRun': 1,
-                'skipped': 0,
-                'errors': unicode(traceback.format_exc()),
-                'failures': '',
-            }
+            if self.debug:
+                traceback.print_exc()
+                import ipdb
+                ipdb.post_mortem(sys.exc_info()[2])
+                sys.exit(1)
+            result = FakeResult(
+                testsRun=1,
+                skipped=[],
+                errors=unicode(traceback.format_exc()),
+                failures=[]
+            )
         self.q_results.put((
             self.boolshitpid(),
             suite.sid,

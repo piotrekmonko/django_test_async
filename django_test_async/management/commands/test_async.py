@@ -32,6 +32,9 @@ class Command(BaseCommand):
             action='store_true', dest='failfast', default=False,
             help='Tells Django to stop running the test suite after first '
                  'failed test.'),
+        make_option('--debug',
+            action='store_true', dest='debug', default=False,
+            help='Run verbose and single-threaded. Drop to shell on exception.'),
         # make_option('--liveserver',
         #     action='store', dest='liveserver', default=None,
         #     help='Overrides the default address where the live server (used '
@@ -184,7 +187,14 @@ class Command(BaseCommand):
         self.verbosity = options['verbosity'] = int(options.get('verbosity'))
         self.max_procs = int(options.pop('processes', None) or cpu_count())
         self.max_tasks = options.pop('max_tasks')
-        failfast = options.pop('failfast')
+        self.debug = options['debug']
+        if self.debug:
+            self.max_procs = 1
+            failfast = options['failfast'] = True
+            if self.verbosity == 1:
+                self.verbosity = options['verbosity'] = 6
+        else:
+            failfast = options.pop('failfast')
 
         if options.get('liveserver') is not None:
             os.environ['DJANGO_LIVE_TEST_SERVER_ADDRESS'] = options['liveserver']
@@ -353,21 +363,22 @@ class Command(BaseCommand):
             total_errs += self.tests_done[bid]['errors']
             total_fails += self.tests_done[bid]['failures']
 
-        for tst, statedict in self.suites_errors():
-            if statedict['errors']:
-                self.log(1, '=' * 70)
-                self.log(1, 'ERROR:', tst.sid)
-                self.log(1, tst._tests[0].shortDescription())
-                self.log(1, '-' * 70)
-                self.log(1, statedict['errors'])
-                self.log(1, 'ERROR', tst.sid)
-            if statedict['failures']:
-                self.log(1, '=' * 70)
-                self.log(1, 'FAILURE:', tst.sid)
-                self.log(1, tst._tests[0].shortDescription())
-                self.log(1, '-' * 70)
-                self.log(1, statedict['failures'])
-                self.log(1, 'FAILURE:', tst.sid)
+        if not self.debug:
+            for tst, statedict in self.suites_errors():
+                if statedict['errors']:
+                    self.log(1, '=' * 70)
+                    self.log(1, 'ERROR:', tst.sid)
+                    self.log(1, tst._tests[0].shortDescription())
+                    self.log(1, '-' * 70)
+                    self.log(1, statedict['errors'])
+                    self.log(1, 'ERROR', tst.sid)
+                if statedict['failures']:
+                    self.log(1, '=' * 70)
+                    self.log(1, 'FAILURE:', tst.sid)
+                    self.log(1, tst._tests[0].shortDescription())
+                    self.log(1, '-' * 70)
+                    self.log(1, statedict['failures'])
+                    self.log(1, 'FAILURE:', tst.sid)
 
         still_waiting = self.suites_waiting()
         if len(still_waiting):
