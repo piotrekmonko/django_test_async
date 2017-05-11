@@ -77,6 +77,7 @@ setup(
     install_requires=[
         'billiard',
         'Django',
+        'blessings',
     ],
 
     # List additional groups of dependencies here (e.g. development
