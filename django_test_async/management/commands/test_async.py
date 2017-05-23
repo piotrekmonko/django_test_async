@@ -49,6 +49,9 @@ class Command(BaseCommand):
     args = '[path.to.modulename|path.to.modulename.TestCase|path.to.modulename.TestCase.test_method]...'
 
     requires_model_validation = False
+    can_import_settings = False
+    leave_locale_alone = True
+
     workers = []
     max_procs = 0
     max_tasks = 0
@@ -157,7 +160,7 @@ class Command(BaseCommand):
     def _worker_status_colorized(self, (pid, v)):
         cons = self.consumer(pid)
         alive = cons.is_alive()
-        ss = '{}{}s{}-{}E'.format(
+        ss = '{}{}-{}S-{}E'.format(
             'A' if alive else 'D',
             v['run'],
             v['skipped'],
@@ -302,7 +305,7 @@ class Command(BaseCommand):
                             pid, test_id, test_result = response_body
                     except Empty:
                         self.log(5, '>>> skipped a bit', pid, alive, p_done, total)
-                        time.sleep(0.2)
+                        time.sleep(0.01)
                         continue
 
                     if test_id == STOPBIT:
@@ -317,7 +320,10 @@ class Command(BaseCommand):
                             if pid not in self.global_errors:
                                 self.global_errors[pid] = []
                             self.global_errors[pid].append(test_result)
-                        skipped += test_result['skipped']
+                        try:
+                            skipped += test_result['skipped']
+                        except TypeError:
+                            import ipdb; ipdb.set_trace()
 
                         self.tests_done[pid]['run'] += 1
                         self.tests_done[pid]['skipped'] += test_result['skipped']

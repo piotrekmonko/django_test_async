@@ -1,5 +1,6 @@
 from Queue import Empty
 from collections import namedtuple
+from pprint import pprint, pformat
 import traceback
 from billiard import Process
 from django.test.runner import DiscoverRunner
@@ -34,13 +35,13 @@ class _FailedTest(TestCase):
 
 
 def _make_failed_import_test(name, suiteClass):
-    message = 'Failed to import test module: %s' % name
+    message = 'Failed to import test module: %s\n%s' % (name, traceback.format_exc())
     test = _FailedTest(name, ImportError(message))
     return suiteClass((test,))
 
 
 def _make_failed_load_tests(name, exception, suiteClass):
-    test = _FailedTest(name, exception)
+    test = _FailedTest(name, traceback.format_exc())
     return suiteClass((test,))
 
 
@@ -151,7 +152,12 @@ class Consumer(Process):
             if 'south' in self.settings.INSTALLED_APPS:
                 a += (' - perhaps try without south?',)
             if self.interactive:
-                import ipdb; ipdb.set_trace()
+                import ipdb
+                if self.debug:
+                    pprint(self.settings.DATABASES)
+                    ipdb.post_mortem(sys.exc_info()[2])
+                else:
+                    ipdb.set_trace()
             self.log(*a)
             self.cleanup()
             raise e
@@ -173,7 +179,7 @@ class Consumer(Process):
             result = FakeResult(
                 testsRun=1,
                 skipped=[],
-                errors=unicode(traceback.format_exc()),
+                errors=[('', unicode(traceback.format_exc()))],
                 failures=[]
             )
         self.q_results.put((
@@ -220,6 +226,8 @@ class Consumer(Process):
         else:
             self.settings.DATABASES[db]['ENGINE'] = 'django.db.backends.sqlite3'
 
+        self.settings.DATABASES[db]['PASSWORD'] = None
+
         self.settings.DATABASES[db]['TEST_NAME'] = os.path.join(
             self.BASEDIR,
             'db_{}_{}'.format(
@@ -227,26 +235,25 @@ class Consumer(Process):
                 self.settings.DATABASES[db].get('TEST_NAME', 'notestname')
             )
         )
+
         if not self.settings.DATABASES[db]['NAME']:
             self.settings.DATABASES[db]['NAME'] = os.path.join(
                 self.BASEDIR,
                 'db_{}'.format(self.boolshitpid())
             )
 
+        self.settings.SOUTH_DATABASE_ADAPTERS[db] = 'south.db.sqlite3'
+
     def apply_patches(self):
         # patch testLoader to make it pickable
         patch_loader()
 
         # alter settings
-        from django.conf import settings
+        from django import conf
         from django import VERSION
         is_17 = VERSION[0] == 1 and VERSION[1] == 7
 
-        self.settings = settings
-        for db in settings.DATABASES:
-            self.setup_db(db)
-        if is_17:
-            self.setup_db('TEST')
+        settings = conf.settings
 
         for cc in settings.CACHES:
             settings.CACHES[cc]['KEY_PREFIX'] = 'pid_{}_{}'.format(
@@ -255,6 +262,7 @@ class Consumer(Process):
             if 'FileBased' in settings.CACHES[cc]['BACKEND']:
                 settings.CACHES[cc]['LOCATION'] = os.path.join(self.BASEDIR, 'cache', cc)
 
+        # nwc specific
         settings.WORK_DIR = os.path.join(self.BASEDIR, 'work_%s' % self.boolshitpid())
         if not os.path.exists(settings.WORK_DIR):
             os.mkdir(settings.WORK_DIR)
@@ -264,7 +272,22 @@ class Consumer(Process):
         settings.TENANT_DIR = os.path.join(settings.WORK_DIR, 'tenant')
         if not os.path.exists(settings.TENANT_DIR):
             os.mkdir(settings.TENANT_DIR)
+        settings.BUILD_DATABASE_DEFAULTS['ENGINE'] = 'django.db.backends.sqlite3'
+        settings.BUILD_DATABASE_DEFAULTS['PASSWORD'] = None
+        settings.ROOT_USER['ENGINE'] = 'django.db.backends.sqlite3'
+        settings.ROOT_USER['NAME'] = 'sqlite3'
+        settings.ROOT_USER['PASSWORD'] = None
         self.settings = settings
+
+        for db in settings.DATABASES:
+            self.setup_db(db)
+        if is_17:
+            self.setup_db('TEST')
+
+        self.settings.DATABASES = dict(self.settings.DATABASES.items())
+        # os.environ['DJANGO_SETTINGS_MODULE'] = self.name + '.py'
+        # with open(os.environ['DJANGO_SETTINGS_MODULE'], 'wb') as cf:
+        #     cf.write(pformat(self.settings._wrapped.__dict__))
 
     def cleanup(self):
         try:
